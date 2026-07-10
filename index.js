@@ -1,14 +1,13 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits } from 'discord.js';
 import Groq from 'groq-sdk';
+import google from 'googlethis'; // Tambahan buat Googling!
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-
-// Memory per user — reset tiap bot restart
 const conversationHistory = new Map();
-const MAX_HISTORY = 20; // 10 exchange (user + denis), bisa naikin kalo mau lebih panjang
+const MAX_HISTORY = 20;
 
 const SYSTEM_PROMPT = `Nama lu Denis. Lu temen akrab Malik (panggil "Lik" atau "Malik") di Discord — bukan asisten, tapi partner in crime-nya, kayak Jarvis buat Tony Stark.
 
@@ -43,6 +42,27 @@ Kalau cara Malik nulis keliatan overwhelmed, muter-muter gak jelas, atau vibenya
 MEMORI:
 Satu-satunya hal yang lo "inget" adalah apa yang literally ada di conversation history yang dikirim ke lo di session ini. Kalau konteksnya ada di sana, lo boleh reference — dan harus akurat, jangan salah detail. Kalau gak ada di history, jangan pura-pura inget dan jangan tebak atau karang detailnya. Bilang aja "gua gak inget persis" atau "kayaknya sih..." biar jelas lo gak yakin. Ngaku gak tau lebih baik daripada ngarang.`;
 
+// Definisi Tools untuk dikirim ke AI
+const tools = [
+    {
+        type: "function",
+        function: {
+            name: "search_web",
+            description: "Gunakan ini HANYA jika Malik menanyakan informasi yang membutuhkan data real-time, cuaca saat ini, harga pasar terkini, atau berita terbaru. Jangan gunakan ini untuk pertanyaan umum.",
+            parameters: {
+                type: "object",
+                properties: {
+                    query: {
+                        type: "string",
+                        description: "Kata kunci pencarian untuk Google. Buat singkat dan akurat, misalnya 'Harga Bitcoin hari ini' atau 'Berita bola terbaru'.",
+                    }
+                },
+                required: ["query"],
+            },
+        },
+    }
+];
+
 client.once('ready', () => {
     console.log(`Beres! Bot lu udah online sebagai ${client.user.tag}`);
 });
@@ -56,17 +76,13 @@ client.on('messageCreate', async (message) => {
 
     const userId = message.author.id;
 
-    // Init history kalo user baru
     if (!conversationHistory.has(userId)) {
         conversationHistory.set(userId, []);
     }
 
     const history = conversationHistory.get(userId);
-
-    // Tambahin pesan user ke history
     history.push({ role: "user", content: prompt });
 
-    // Trim kalo udah kelewat panjang, buang dari depan
     while (history.length > MAX_HISTORY) {
         history.shift();
     }
@@ -74,25 +90,74 @@ client.on('messageCreate', async (message) => {
     try {
         await message.channel.sendTyping();
 
-        const chatCompletion = await groq.chat.completions.create({
+        // Panggilan Pertama: Nanya ke Groq, butuh Googling gak nih?
+        let chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: SYSTEM_PROMPT },
                 ...history
             ],
             model: "llama-3.3-70b-versatile",
             temperature: 0.85,
-            max_tokens: 512, // Hemat token — Denis harusnya concise by default
+            max_tokens: 512,
+            tools: tools,           // Masukin tools ke AI
+            tool_choice: "auto",    // Biarin AI milih sendiri butuh tool atau gak
         });
 
-        const replyText = chatCompletion.choices[0]?.message?.content || "Eh Lik, gua gak dapet respon dari Groq.";
+        let responseMessage = chatCompletion.choices[0]?.message;
 
-        // Tambahin respon Denis ke history
+        // Cek apakah AI memutuskan buat manggil fungsi 'search_web'
+        if (responseMessage.tool_calls) {
+            const toolCall = responseMessage.tool_calls[0];
+            const functionArgs = JSON.parse(toolCall.function.arguments);
+            const searchQuery = functionArgs.query;
+
+            console.log(`[LOG] Denis lagi nyari di web: ${searchQuery}`);
+
+            // Proses pencarian ke Google
+            let searchResultText = "";
+            try {
+                const searchOptions = { page: 0, safe: false, additional_params: { hl: 'id' } };
+                const res = await google.search(searchQuery, searchOptions);
+                
+                // Ambil 3 hasil paling atas biar hemat token
+                searchResultText = res.results.slice(0, 3).map(r => `Judul: ${r.title}\nDeskripsi: ${r.description}`).join("\n\n");
+                if(!searchResultText) searchResultText = "Tidak ditemukan hasil di Google.";
+            } catch (err) {
+                console.error("Gagal nyari Google:", err);
+                searchResultText = "Gagal mengakses internet. Kasih tau Malik kalo jaringan lagi error.";
+            }
+
+            // Panggilan Kedua: Ngirim hasil Googling ke Denis biar dirangkum
+            const messagesForSecondCall = [
+                { role: "system", content: SYSTEM_PROMPT },
+                ...history,
+                responseMessage, // Pesen dari AI yang minta tool call (Wajib disertain)
+                {
+                    tool_call_id: toolCall.id,
+                    role: "tool",
+                    name: "search_web",
+                    content: searchResultText
+                }
+            ];
+
+            const secondCall = await groq.chat.completions.create({
+                messages: messagesForSecondCall,
+                model: "llama-3.3-70b-versatile",
+                temperature: 0.85,
+                max_tokens: 512,
+            });
+
+            responseMessage = secondCall.choices[0]?.message;
+        }
+
+        const replyText = responseMessage?.content || "Eh Lik, gua agak nge-bug nih, gak dapet respon dari server.";
+
         history.push({ role: "assistant", content: replyText });
-
         message.reply(replyText.substring(0, 2000));
+
     } catch (error) {
         console.error("Error Detail:", error);
-        message.reply("Aduh ada yang error pas gua mau jawab, Lik. Coba lagi.");
+        message.reply("Aduh Lik, otak gua nge-hang bentar. Coba chat lagi.");
     }
 });
 
