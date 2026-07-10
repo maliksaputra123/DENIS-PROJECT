@@ -21,11 +21,18 @@ client.on('messageCreate', async (message) => {
 
     try {
         await message.channel.sendTyping();
-        const chatCompletion = await groq.chat.completions.create({
-            messages: [{ role: "user", content: prompt }],
-            model: "llama-3.3-70b-versatile",
-        });
-
+            const chatCompletion = await groq.chat.completions.create({
+                messages: [
+                    {
+                        role: "system",
+                        content: "Lu adalah temen akrab yang santai, asik, dan gak kaku. Lu bukan asisten robot, tapi temen curhat atau temen diskusi yang seru. Gaya bahasa lu santai, pake bahasa sehari-hari yang luwes, to-the-point, dan gak perlu sok formal. Jangan pernah pake kalimat 'Sebagai model AI' atau kalimat template yang membosankan. Kalau temen lu bercanda, bales bercanda. Kalau dia lagi mumet, semangatin. Pokoknya anggap aja kita lagi chatan santai."
+                    },
+                    { role: "user", content: prompt }
+                ],
+                model: "llama-3.3-70b-versatile",
+                temperature: 0.9,
+                max_tokens: 1024,
+            });
         const replyText = chatCompletion.choices[0]?.message?.content || "Maaf, gua gak dapet respon dari Groq.";
         message.reply(replyText.substring(0, 2000));
     } catch (error) {
