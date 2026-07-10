@@ -13,11 +13,81 @@ const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
 const OWNER_ID = '702743669219917845'; // Discord user ID penerima laporan evaluasi
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── INTERACTION LOGGER ────────────────────────────────────────────────────────
-// Catat setiap interaksi ke logs/interactions.json buat bahan evaluasi 3 hari.
-// Struktur tiap entry: { ts, prompt, response, searchUsed, cacheHit, searchQuery }
+// ── GLOBAL SAFETY NET ─────────────────────────────────────────────────────────
+// Biar bot gak diem-diem mati kalau ada promise/error yang lolos.
+process.on('unhandledRejection', (reason) => console.error('[UNHANDLED REJECTION]', reason));
+process.on('uncaughtException', (err) => console.error('[UNCAUGHT EXCEPTION]', err));
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── HELPER UMUM ───────────────────────────────────────────────────────────────
+// Ambil value header baik dari Headers (fetch) maupun plain object (APIError).
+function headerGet(headers, key) {
+    if (!headers) return null;
+    if (typeof headers.get === 'function') return headers.get(key);
+    return headers[key] ?? headers[key.toLowerCase()] ?? null;
+}
+
+// Pecah teks jadi potongan <=2000 char, usahain motong di newline biar rapi.
+function splitMessage(text, max = 2000) {
+    if (text.length <= max) return [text];
+    const chunks = [];
+    let current = "";
+    for (const line of text.split('\n')) {
+        if (current.length + line.length + 1 > max) {
+            if (current) chunks.push(current);
+            if (line.length > max) {
+                for (let i = 0; i < line.length; i += max) chunks.push(line.slice(i, i + max));
+                current = "";
+            } else {
+                current = line;
+            }
+        } else {
+            current = current ? current + '\n' + line : line;
+        }
+    }
+    if (current) chunks.push(current);
+    return chunks;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── GROQ WRAPPER (retry 429/5xx + capture limit) ──────────────────────────────
+// Semua call ke Groq lewat sini. Otomatis retry pas kena rate limit (hormatin
+// header retry-after) atau error server, sekalian nangkep sisa kuota dari header.
+async function groqCreate(params, { retries = 3 } = {}) {
+    let lastErr;
+    for (let attempt = 0; attempt <= retries; attempt++) {
+        try {
+            const { data, response } = await groq.chat.completions.create(params).withResponse();
+            if (params.model) captureGroqLimits(params.model, response);
+            return data;
+        } catch (err) {
+            lastErr = err;
+            const status = err?.status;
+            if (status === 429 && attempt < retries) {
+                const retryAfter = parseFloat(headerGet(err?.headers, 'retry-after'));
+                const waitMs = Math.min((retryAfter > 0 ? retryAfter : 2 ** attempt) * 1000, 30000);
+                console.warn(`[GROQ 429] attempt ${attempt + 1}/${retries}, nunggu ${(waitMs / 1000).toFixed(1)}s`);
+                await new Promise(r => setTimeout(r, waitMs));
+                continue;
+            }
+            if (status >= 500 && attempt < retries) {
+                const waitMs = (2 ** attempt) * 1000;
+                console.warn(`[GROQ ${status}] attempt ${attempt + 1}/${retries}, nunggu ${(waitMs / 1000).toFixed(1)}s`);
+                await new Promise(r => setTimeout(r, waitMs));
+                continue;
+            }
+            throw err;
+        }
+    }
+    throw lastErr;
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── INTERACTION LOGGER (append-only JSONL) ────────────────────────────────────
+// Ditulis append-only biar gak baca-tulis seluruh file tiap pesan (hemat I/O,
+// gak ada read-modify-write). readLogs tetap kompatibel sama format array lama.
 const LOG_DIR = './logs';
-const LOG_FILE = path.join(LOG_DIR, 'interactions.json');
+const LOG_FILE = path.join(LOG_DIR, 'interactions.jsonl');
 
 function ensureLogDir() {
     if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
@@ -26,42 +96,108 @@ function ensureLogDir() {
 function readLogs() {
     ensureLogDir();
     if (!fs.existsSync(LOG_FILE)) return [];
-    try { return JSON.parse(fs.readFileSync(LOG_FILE, 'utf-8')); }
-    catch { return []; }
+    try {
+        const raw = fs.readFileSync(LOG_FILE, 'utf-8').trim();
+        if (!raw) return [];
+        // Fallback: kalau file lama masih format JSON array
+        if (raw.startsWith('[')) {
+            try { return JSON.parse(raw); } catch { /* lanjut parse per-line */ }
+        }
+        return raw.split('\n').map(line => {
+            try { return JSON.parse(line); } catch { return null; }
+        }).filter(Boolean);
+    } catch { return []; }
 }
 
 function writeLog(entry) {
-    const logs = readLogs();
-    logs.push(entry);
-    fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+    ensureLogDir();
+    fs.appendFileSync(LOG_FILE, JSON.stringify(entry) + '\n');
 }
 
 function clearLogs() {
-    fs.writeFileSync(LOG_FILE, JSON.stringify([], null, 2));
+    fs.writeFileSync(LOG_FILE, '');
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── EVALUASI 3 HARI ───────────────────────────────────────────────────────────
-// Tiap 3 hari, ambil semua log, kirim ke Groq buat dianalisis,
-// hasilnya di-DM langsung ke Malik di Discord.
-const EVAL_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000; // 3 hari dalam ms
+// ── LIMIT MONITOR (Groq header + Tavily usage) ────────────────────────────────
+// Groq nyimpen sisa kuota di response header tiap request (walau sukses).
+// x-ratelimit-limit-requests = RPD (harian), remaining = sisa harian.
+const groqLimits = new Map(); // model -> { limitReq, remainingReq, ts }
 
-async function runEvaluation() {
-    const logs = readLogs();
-    if (logs.length === 0) {
-        console.log('[EVAL] Gak ada log yang perlu dievaluasi.');
-        return;
+function captureGroqLimits(model, response) {
+    try {
+        const h = response?.headers;
+        if (!h) return;
+        const num = (k) => {
+            const v = headerGet(h, k);
+            if (v == null) return null;
+            const n = parseInt(v, 10);
+            return Number.isNaN(n) ? null : n;
+        };
+        groqLimits.set(model, {
+            limitReq: num('x-ratelimit-limit-requests'),
+            remainingReq: num('x-ratelimit-remaining-requests'),
+            ts: Date.now(),
+        });
+    } catch { /* jangan sampai parsing header bikin bot crash */ }
+}
+
+function fmtGroqLine(model) {
+    const l = groqLimits.get(model);
+    if (!l || l.limitReq == null || l.remainingReq == null) {
+        return `• ${model}: belum ke-capture (chat dulu biar ke-baca)`;
     }
+    const used = l.limitReq - l.remainingReq;
+    const pct = l.limitReq ? Math.round(used / l.limitReq * 100) : 0;
+    return `• ${model}: ${used}/${l.limitReq} req harian (${pct}% kepake, sisa ${l.remainingReq})`;
+}
 
-    console.log(`[EVAL] Mulai evaluasi ${logs.length} interaksi...`);
+// Tavily /usage — GET dengan Bearer API key + timeout 5 detik biar gak nge-gantung.
+async function getTavilyUsage() {
+    const controller = new AbortController();
+    const t = setTimeout(() => controller.abort(), 5000);
+    try {
+        const res = await fetch('https://api.tavily.com/usage', {
+            headers: { Authorization: `Bearer ${process.env.TAVILY_API_KEY}` },
+            signal: controller.signal,
+        });
+        if (!res.ok) return null;
+        return await res.json();
+    } catch (err) {
+        console.error(`[TAVILY USAGE ERROR] ${err.message}`);
+        return null;
+    } finally {
+        clearTimeout(t);
+    }
+}
 
-    // Statistik dasar — dihitung lokal, gak perlu hit Groq
+function fmtTavilyLine(u) {
+    if (!u?.key || u.key.limit == null) return `• Tavily: gagal ambil data usage`;
+    const { usage: used, limit } = u.key;
+    const pct = limit ? Math.round(used / limit * 100) : 0;
+    return `• Tavily: ${used}/${limit} credit (${pct}% kepake, sisa ${limit - used})`;
+}
+
+// Susun blok "Limit / Kuota" buat ditempel ke laporan
+async function buildLimitBlock() {
+    const tavilyUsage = await getTavilyUsage();
+    return [
+        ``,
+        `**Limit / Kuota:**`,
+        fmtGroqLine("qwen/qwen3-32b"),
+        fmtGroqLine("llama-3.1-8b-instant"),
+        fmtTavilyLine(tavilyUsage),
+    ].join('\n');
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── BUILDER LAPORAN EVALUASI (dipakai /eval manual & evaluasi otomatis) ────────
+function buildStats(logs) {
     const totalInteraksi = logs.length;
     const searchCount = logs.filter(l => l.searchUsed).length;
     const cacheHitCount = logs.filter(l => l.cacheHit).length;
     const searchQueries = logs.filter(l => l.searchQuery).map(l => l.searchQuery);
 
-    // Topik terbanyak dari search queries
     const topicFreq = {};
     searchQueries.forEach(q => {
         q.toLowerCase().split(/\s+/).forEach(w => {
@@ -74,32 +210,51 @@ async function runEvaluation() {
         .map(([word, count]) => `${word} (${count}x)`)
         .join(', ') || 'tidak ada';
 
-    // Sample max 30 entry terakhir buat analisis Groq — hindari overload token
+    return { totalInteraksi, searchCount, cacheHitCount, topTopics };
+}
+
+async function analyzeLogsWithGroq(logs) {
     const sample = logs.slice(-30).map(l =>
         `[${new Date(l.ts).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}]\nUser: ${l.prompt}\nDenis: ${l.response}\nSearch: ${l.searchUsed ? `Ya (${l.searchQuery})` : 'Tidak'}`
     ).join('\n\n---\n\n');
 
+    const evalCall = await groqCreate({
+        messages: [
+            {
+                role: "system",
+                content: "Kamu adalah analis kinerja AI chatbot bernama Denis. Tugasmu menganalisis log percakapan Denis dengan Malik dan memberikan laporan evaluasi dalam Bahasa Indonesia yang jujur, to the point, dan actionable. Format laporan harus ringkas, gak bertele-tele."
+            },
+            {
+                role: "user",
+                content: `Ini sample log percakapan Denis:\n\n${sample}\n\nAnalisis singkat tentang:\n1. Pola percakapan yang sering muncul\n2. Kasus Denis kurang natural atau salah baca situasi (kalau ada)\n3. Topik yang sering ditanya tapi mungkin kurang ditangani dengan baik\n4. Saran konkret untuk improve system prompt atau behavior Denis\n\nMaksimal 300 kata, to the point.`
+            }
+        ],
+        model: "llama-3.1-8b-instant",
+        temperature: 0.3,
+        max_tokens: 600,
+    });
+
+    return evalCall.choices[0]?.message?.content || "Analisis gagal dihasilkan.";
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── EVALUASI 3 HARI ───────────────────────────────────────────────────────────
+const EVAL_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000; // 3 hari dalam ms
+
+async function runEvaluation() {
+    const logs = readLogs();
+    if (logs.length === 0) {
+        console.log('[EVAL] Gak ada log yang perlu dievaluasi.');
+        return;
+    }
+
+    console.log(`[EVAL] Mulai evaluasi ${logs.length} interaksi...`);
+
     try {
-        // Analisis kualitatif via Groq — pakai 8B buat hemat RPD, bukan main model
-        const evalCall = await groq.chat.completions.create({
-            messages: [
-                {
-                    role: "system",
-                    content: `Kamu adalah analis kinerja AI chatbot bernama Denis. Tugasmu menganalisis log percakapan Denis dengan Malik dan memberikan laporan evaluasi dalam Bahasa Indonesia yang jujur, to the point, dan actionable. Format laporan harus ringkas, gak bertele-tele.`
-                },
-                {
-                    role: "user",
-                    content: `Ini sample log percakapan Denis selama 3 hari terakhir:\n\n${sample}\n\nAnalisis singkat tentang:\n1. Pola percakapan yang sering muncul\n2. Kasus Denis kurang natural atau salah baca situasi (kalau ada)\n3. Topik yang sering ditanya tapi mungkin kurang ditangani dengan baik\n4. Saran konkret untuk improve system prompt atau behavior Denis\n\nMaksimal 300 kata, to the point.`
-                }
-            ],
-            model: "llama-3.1-8b-instant",
-            temperature: 0.3,
-            max_tokens: 600,
-        });
+        const { totalInteraksi, searchCount, cacheHitCount, topTopics } = buildStats(logs);
+        const analisis = await analyzeLogsWithGroq(logs);
+        const limitBlock = await buildLimitBlock();
 
-        const analisis = evalCall.choices[0]?.message?.content || "Analisis gagal dihasilkan.";
-
-        // Susun laporan lengkap
         const laporan = [
             `📊 **EVALUASI DENIS — 3 Hari Terakhir**`,
             ``,
@@ -108,6 +263,7 @@ async function runEvaluation() {
             `• Search triggered: ${searchCount}x (${Math.round(searchCount / totalInteraksi * 100)}%)`,
             `• Cache hit: ${cacheHitCount}x (hemat ${cacheHitCount} Tavily request)`,
             `• Topik search terbanyak: ${topTopics}`,
+            limitBlock,
             ``,
             `**Analisis AI:**`,
             analisis,
@@ -115,14 +271,9 @@ async function runEvaluation() {
             `_Log periode ini sudah direset. Periode baru dimulai sekarang._`
         ].join('\n');
 
-        // DM ke Malik — split kalau lebih dari 2000 char
         const owner = await client.users.fetch(OWNER_ID);
-        if (laporan.length <= 2000) {
-            await owner.send(laporan);
-        } else {
-            await owner.send(laporan.substring(0, 2000));
-            const sisa = laporan.substring(2000);
-            if (sisa.trim()) await owner.send(sisa);
+        for (const chunk of splitMessage(laporan)) {
+            await owner.send(chunk);
         }
 
         console.log('[EVAL] Laporan berhasil dikirim ke Malik.');
@@ -133,38 +284,38 @@ async function runEvaluation() {
     }
 }
 
-// Jalankan tiap 3 hari
 setInterval(runEvaluation, EVAL_INTERVAL_MS);
 // ─────────────────────────────────────────────────────────────────────────────
 
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
 
-// ── SEARCH CACHE ──────────────────────────────────────────────────────────────
-// Simpan hasil Tavily selama 10 menit. Query yang sama dalam window ini
-// langsung return cache — gak hit API lagi.
+// ── SEARCH CACHE (dengan negative cache) ──────────────────────────────────────
+// Simpan hasil Tavily 10 menit. Search yang GAGAL di-cache singkat (90 detik)
+// biar query rusak yang sama gak ngehit Tavily terus-terusan.
 const searchCache = new Map();
-const CACHE_TTL_MS = 10 * 60 * 1000; // 10 menit
+const CACHE_TTL_MS = 10 * 60 * 1000;  // 10 menit buat hasil sukses
+const NEG_CACHE_TTL_MS = 90 * 1000;   // 90 detik buat hasil gagal/kosong
 
 function getCached(query) {
     const entry = searchCache.get(query);
-    if (!entry) return null;
-    if (Date.now() - entry.ts > CACHE_TTL_MS) {
+    if (!entry) return { hit: false, result: null };
+    if (Date.now() - entry.ts > entry.ttl) {
         searchCache.delete(query);
-        return null;
+        return { hit: false, result: null };
     }
-    return entry.result;
+    return { hit: true, result: entry.result }; // result bisa null (negative cache)
 }
 
-function setCache(query, result) {
-    searchCache.set(query, { result, ts: Date.now() });
+function setCache(query, result, ttl = CACHE_TTL_MS) {
+    searchCache.set(query, { result, ts: Date.now(), ttl });
 }
 
 // Bersih-bersih cache lama tiap 30 menit biar gak numpuk di memori
 setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of searchCache.entries()) {
-        if (now - entry.ts > CACHE_TTL_MS) searchCache.delete(key);
+        if (now - entry.ts > entry.ttl) searchCache.delete(key);
     }
 }, 30 * 60 * 1000);
 // ─────────────────────────────────────────────────────────────────────────────
@@ -201,6 +352,12 @@ Pikir dulu maksimal. Kalau gak nemu, bilang jujur: "gua gak nemu info spesifikny
 KALAU ADA [HASIL PENCARIAN]:
 Itu data aktual dari internet. Jadiin referensi utama, langsung jawab — jangan bilang "gua gak punya akses real-time".
 
+ANTI-NGARANG (penting):
+- JANGAN pernah ngarang detail spesifik: angka, skor, menit gol, nama pemain, nama wasit, statistik, tanggal. Kalau detail itu gak ADA di [HASIL PENCARIAN] atau conversation history, jangan disebut. Bilang "gua gak punya detail segitu" atau "yang gua tau cuma...".
+- Sampaikan apa yang beneran ada di data. Jangan dilengkapin sendiri biar keliatan lengkap.
+- Tag "[HASIL PENCARIAN]", "[PENCARIAN ... tidak berhasil]" dan sejenisnya itu catatan internal — JANGAN pernah ditulis ulang atau disebut ke Malik. Langsung pake isinya buat jawab.
+- Kalau Malik ngoreksi fakta lo (skor/angka/nama), jangan ngotot. Akui bisa salah; kalau ada [HASIL PENCARIAN] baru, ikutin itu.
+
 STRESS DETECTION:
 Kalau Malik keliatan overwhelmed atau muter-muter — ingetin dengan cara wajar, gak lebay. Dia iya? Acknowledge singkat, lanjut. Bilang gak? Skip.
 
@@ -209,6 +366,8 @@ Yang lo "inget" hanya apa yang literally ada di conversation history session ini
 
 const SEARCH_DECIDER_PROMPT = `Tugasmu: tentukan apakah pesan user butuh pencarian internet atau tidak.
 Kalau butuh, buat query pencarian yang bersih — hapus kata waktu relatif (semalam, kemarin, hari ini, sekarang, tadi, malem ini) dan ambil inti subjeknya saja.
+
+Kalau user ngoreksi/ngeragukan fakta yang butuh data terkini (skor, hasil, angka, tanggal, siapa menang) — misal "bukan 2-1 ya?", "serius hasilnya segitu?", "yakin?" — dan konteksnya soal yang tadi dicari, tetap SEARCH ulang subjeknya buat verifikasi.
 
 Balas HANYA dengan salah satu format ini, tanpa tambahan apapun:
 SEARCH: <query bersih>
@@ -219,16 +378,32 @@ Contoh:
 "siapa yang menang prancis vs maroko semalam?" → SEARCH: hasil pertandingan prancis vs maroko
 "cuaca bandung hari ini" → SEARCH: cuaca bandung
 "harga bitcoin sekarang" → SEARCH: harga bitcoin
+Konteks: tadi nanya skor spanyol vs belgia → "bukan nya 2-1 ya" → SEARCH: hasil pertandingan spanyol vs belgia
 "halo" → NO_SEARCH
 "wtf" → NO_SEARCH
 "2+2 berapa" → NO_SEARCH`;
 
+// Pre-filter murah: skip decider LLM buat reaksi/filler yang jelas gak butuh search.
+// Sengaja konservatif — kata yang bisa jadi koreksi fakta (serius, yakin, masa, hah)
+// TIDAK dimasukin, biar rule re-search di decider tetap jalan.
+const TRIVIAL_WORDS = new Set([
+    'wkwk', 'wkwkwk', 'wk', 'lol', 'lmao', 'wow', 'sip', 'siap', 'gas', 'yoi',
+    'mantap', 'mantul', 'oke', 'ok', 'okay', 'nice', 'cool', 'hmm', 'hmmm',
+    'gg', 'anjay', 'njir', 'wadaw', 'wah'
+]);
+
+function isTrivial(text) {
+    const t = text.toLowerCase().replace(/[^\w\s]/g, '').trim();
+    if (t.length <= 2) return true;
+    const words = t.split(/\s+/);
+    return words.length <= 2 && words.every(w => TRIVIAL_WORDS.has(w));
+}
+
 async function doSearch(query) {
-    // Cek cache dulu sebelum hit Tavily
     const cached = getCached(query);
-    if (cached) {
+    if (cached.hit) {
         console.log(`[SEARCH] Cache hit: "${query}"`);
-        return cached;
+        return cached.result; // bisa null kalau ini negative cache
     }
 
     try {
@@ -247,28 +422,24 @@ async function doSearch(query) {
         }
 
         const result = parts.filter(Boolean).join('\n') || null;
-
-        // Simpan ke cache kalau ada hasil
-        if (result) setCache(query, result);
-
+        // Sukses → cache 10 menit. Kosong → negative cache 90 detik.
+        setCache(query, result, result ? CACHE_TTL_MS : NEG_CACHE_TTL_MS);
         return result;
     } catch (err) {
         console.error(`[SEARCH ERROR] ${err.message}`);
+        setCache(query, null, NEG_CACHE_TTL_MS); // negative cache biar gak spam Tavily
         return null;
     }
 }
 
-// Trim history ke N pesan terakhir sebelum dikirim ke main call.
-// Ini ngurangin token tanpa ngubah batas penyimpanan history (MAX_HISTORY).
-// MAX_HISTORY tetap 20 buat konteks in-memory, tapi yang dikirim ke Groq
-// cukup 10 pesan terakhir — cukup buat konteks percakapan, jauh lebih hemat.
 const MAX_HISTORY_SENT = 10;
 
 client.once('ready', async () => {
     console.log(`Denis online sebagai ${client.user.tag}`);
 
     // ── REGISTER SLASH COMMAND /eval ─────────────────────────────────────────
-    // Otomatis register tiap bot start — Discord cache command-nya.
+    // Kalau GUILD_ID di-set di .env → daftar ke guild itu (update instan).
+    // Kalau enggak → global (propagasi bisa sampai 1 jam).
     try {
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
         const commands = [
@@ -277,8 +448,13 @@ client.once('ready', async () => {
                 .setDescription('Tampilkan laporan evaluasi Denis sekarang')
                 .toJSON()
         ];
-        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
-        console.log('[SLASH] /eval berhasil didaftarkan.');
+        if (process.env.GUILD_ID) {
+            await rest.put(Routes.applicationGuildCommands(client.user.id, process.env.GUILD_ID), { body: commands });
+            console.log('[SLASH] /eval didaftarkan ke guild (instan).');
+        } else {
+            await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+            console.log('[SLASH] /eval didaftarkan global (bisa lama propagasinya).');
+        }
     } catch (err) {
         console.error(`[SLASH ERROR] Gagal register command: ${err.message}`);
     }
@@ -286,8 +462,6 @@ client.once('ready', async () => {
 });
 
 // ── HANDLER /eval ─────────────────────────────────────────────────────────────
-// Hanya Malik (OWNER_ID) yang bisa pakai. Ephemeral = cuma lo yang liat.
-// Log TIDAK direset setelah /eval manual — data tetap terkumpul sampai 3 hari.
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== 'eval') return;
@@ -303,45 +477,10 @@ client.on('interactionCreate', async (interaction) => {
         return interaction.editReply('Belum ada log interaksi yang tercatat. Chat dulu sama Denis baru bisa dievaluasi.');
     }
 
-    const totalInteraksi = logs.length;
-    const searchCount = logs.filter(l => l.searchUsed).length;
-    const cacheHitCount = logs.filter(l => l.cacheHit).length;
-    const searchQueries = logs.filter(l => l.searchQuery).map(l => l.searchQuery);
-
-    const topicFreq = {};
-    searchQueries.forEach(q => {
-        q.toLowerCase().split(/\s+/).forEach(w => {
-            if (w.length > 3) topicFreq[w] = (topicFreq[w] || 0) + 1;
-        });
-    });
-    const topTopics = Object.entries(topicFreq)
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-        .map(([word, count]) => `${word} (${count}x)`)
-        .join(', ') || 'tidak ada';
-
-    const sample = logs.slice(-30).map(l =>
-        `[${new Date(l.ts).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}]\nUser: ${l.prompt}\nDenis: ${l.response}\nSearch: ${l.searchUsed ? `Ya (${l.searchQuery})` : 'Tidak'}`
-    ).join('\n\n---\n\n');
-
     try {
-        const evalCall = await groq.chat.completions.create({
-            messages: [
-                {
-                    role: "system",
-                    content: "Kamu adalah analis kinerja AI chatbot bernama Denis. Tugasmu menganalisis log percakapan Denis dengan Malik dan memberikan laporan evaluasi dalam Bahasa Indonesia yang jujur, to the point, dan actionable. Format laporan harus ringkas, gak bertele-tele."
-                },
-                {
-                    role: "user",
-                    content: `Ini sample log percakapan Denis:\n\n${sample}\n\nAnalisis singkat tentang:\n1. Pola percakapan yang sering muncul\n2. Kasus Denis kurang natural atau salah baca situasi (kalau ada)\n3. Topik yang sering ditanya tapi mungkin kurang ditangani dengan baik\n4. Saran konkret untuk improve system prompt atau behavior Denis\n\nMaksimal 300 kata, to the point.`
-                }
-            ],
-            model: "llama-3.1-8b-instant",
-            temperature: 0.3,
-            max_tokens: 600,
-        });
-
-        const analisis = evalCall.choices[0]?.message?.content || "Analisis gagal dihasilkan.";
+        const { totalInteraksi, searchCount, cacheHitCount, topTopics } = buildStats(logs);
+        const analisis = await analyzeLogsWithGroq(logs);
+        const limitBlock = await buildLimitBlock();
 
         const laporan = [
             `📊 **EVALUASI DENIS — Manual**`,
@@ -350,6 +489,7 @@ client.on('interactionCreate', async (interaction) => {
             `• Search triggered: ${searchCount}x (${Math.round(searchCount / totalInteraksi * 100)}%)`,
             `• Cache hit: ${cacheHitCount}x (hemat ${cacheHitCount} Tavily request)`,
             `• Topik search terbanyak: ${topTopics}`,
+            limitBlock,
             ``,
             `**Analisis AI:**`,
             analisis,
@@ -357,7 +497,12 @@ client.on('interactionCreate', async (interaction) => {
             `_Log tidak direset — data tetap terkumpul untuk evaluasi otomatis 3 hari._`
         ].join('\n');
 
-        await interaction.editReply(laporan.substring(0, 2000));
+        // Split kalau >2000 char: chunk pertama editReply, sisanya followUp.
+        const chunks = splitMessage(laporan);
+        await interaction.editReply(chunks[0]);
+        for (let i = 1; i < chunks.length; i++) {
+            await interaction.followUp({ content: chunks[i], ephemeral: true });
+        }
 
     } catch (err) {
         console.error(`[EVAL ERROR] ${err.message}`);
@@ -373,6 +518,11 @@ client.on('messageCreate', async (message) => {
     const prompt = message.content.replace(`<@${client.user.id}>`, '').trim();
     if (!prompt) return message.reply("Ada yang bisa gua bantu, Lik?");
 
+    // Guard: /eval itu slash command, bukan buat di-mention.
+    if (prompt.toLowerCase() === '/eval') {
+        return message.reply('Buat evaluasi, ketik `/eval` sebagai slash command (pilih dari menu), bukan di-mention ya Lik.');
+    }
+
     const userId = message.author.id;
     if (!conversationHistory.has(userId)) conversationHistory.set(userId, []);
 
@@ -381,44 +531,48 @@ client.on('messageCreate', async (message) => {
     while (history.length > MAX_HISTORY) history.shift();
 
     // ── TYPING PERSIST ────────────────────────────────────────────────────────
-    // Re-send typing indicator tiap 8 detik sampai response keluar.
-    // Discord auto-clear typing setelah 10 detik, jadi ini pastiin
-    // Malik tetap liat "bot lagi ngetik" selama proses berjalan.
-    await message.channel.sendTyping();
-    const typingInterval = setInterval(() => message.channel.sendTyping(), 8000);
+    message.channel.sendTyping().catch(() => {});
+    const typingInterval = setInterval(() => message.channel.sendTyping().catch(() => {}), 8000);
 
     try {
-        // Step 1: Decider — kasih 3 pesan terakhir sebagai konteks
-        // Ini bikin decider bisa baca follow-up question dengan bener,
-        // misal "terus hasilnya?" setelah nanya soal bitcoin → tetap SEARCH bitcoin.
-        const deciderContext = history.slice(-3).map(m => `${m.role === "user" ? "User" : "Denis"}: ${m.content}`).join('\n');
-        const deciderInput = `Konteks percakapan terakhir:\n${deciderContext}\n\nPesan terbaru user: ${prompt}`;
+        // Step 1: Decider — skip LLM kalau pesannya reaksi/filler sepele (hemat kuota).
+        let deciderResponse;
+        if (isTrivial(prompt)) {
+            deciderResponse = "NO_SEARCH";
+            console.log('[DECIDER] skip (trivial) → NO_SEARCH');
+        } else {
+            const deciderContext = history.slice(-3).map(m => `${m.role === "user" ? "User" : "Denis"}: ${m.content}`).join('\n');
+            const deciderInput = `Konteks percakapan terakhir:\n${deciderContext}\n\nPesan terbaru user: ${prompt}`;
 
-        const deciderCall = await groq.chat.completions.create({
-            messages: [
-                { role: "system", content: SEARCH_DECIDER_PROMPT },
-                { role: "user", content: deciderInput }
-            ],
-            model: "llama-3.1-8b-instant",
-            temperature: 0.0,
-            max_tokens: 32,
-        });
-
-        const deciderResponse = deciderCall.choices[0]?.message?.content?.trim() || "NO_SEARCH";
-        console.log(`[DECIDER] ${deciderResponse}`);
+            const deciderCall = await groqCreate({
+                messages: [
+                    { role: "system", content: SEARCH_DECIDER_PROMPT },
+                    { role: "user", content: deciderInput }
+                ],
+                model: "llama-3.1-8b-instant",
+                temperature: 0.0,
+                max_tokens: 32,
+            });
+            deciderResponse = deciderCall.choices[0]?.message?.content?.trim() || "NO_SEARCH";
+            console.log(`[DECIDER] ${deciderResponse}`);
+        }
 
         // Step 2: Search kalau perlu
+        const searchUsed = deciderResponse.startsWith("SEARCH:");
+        const searchQuery = searchUsed ? deciderResponse.replace("SEARCH:", "").trim() : null;
+        let cacheHit = false;
         let searchContext = "";
-        if (deciderResponse.startsWith("SEARCH:")) {
-            const query = deciderResponse.replace("SEARCH:", "").trim();
-            console.log(`[SEARCH] Query: ${query}`);
-            const results = await doSearch(query);
+
+        if (searchUsed) {
+            cacheHit = getCached(searchQuery).hit; // cek SEBELUM doSearch biar metriknya akurat
+            console.log(`[SEARCH] Query: ${searchQuery}`);
+            const results = await doSearch(searchQuery);
 
             if (results) {
-                searchContext = `\n\n[HASIL PENCARIAN untuk "${query}"]:\n${results}`;
+                searchContext = `\n\n[HASIL PENCARIAN untuk "${searchQuery}"]:\n${results}`;
                 console.log(`[SEARCH] Berhasil`);
             } else {
-                searchContext = `\n\n[PENCARIAN "${query}" tidak berhasil — gak ada data yang ketemu. Jujur aja ke Malik kalau lo gak nemu infonya, kasih apa yang lo tau dari pengetahuan lo kalo ada, dan JANGAN suruh dia cek sumber lain.]`;
+                searchContext = `\n\n[PENCARIAN "${searchQuery}" tidak berhasil — gak ada data yang ketemu. Jujur aja ke Malik kalau lo gak nemu infonya, kasih apa yang lo tau dari pengetahuan lo kalo ada, dan JANGAN suruh dia cek sumber lain.]`;
                 console.log(`[SEARCH] Gagal`);
             }
         }
@@ -429,10 +583,8 @@ client.on('messageCreate', async (message) => {
             + `\n\nWaktu sekarang: ${currentDate}.`
             + searchContext;
 
-        // Step 4: Main call — kirim hanya slice terakhir dari history
-        // qwen/qwen3-32b: lebih capable dari llama-3.3-70b untuk nuance, persona, dan multilingual
-        // reasoning_effort: "none" → matiin thinking mode bawaan Qwen3, hemat token untuk chatting casual
-        const mainCall = await groq.chat.completions.create({
+        // Step 4: Main call
+        const mainCall = await groqCreate({
             messages: [
                 { role: "system", content: finalSystemPrompt },
                 ...history.slice(-MAX_HISTORY_SENT)
@@ -451,9 +603,9 @@ client.on('messageCreate', async (message) => {
             ts: Date.now(),
             prompt,
             response: responseText,
-            searchUsed: deciderResponse.startsWith("SEARCH:"),
-            cacheHit: deciderResponse.startsWith("SEARCH:") && !!getCached(deciderResponse.replace("SEARCH:", "").trim()),
-            searchQuery: deciderResponse.startsWith("SEARCH:") ? deciderResponse.replace("SEARCH:", "").trim() : null,
+            searchUsed,
+            cacheHit,
+            searchQuery,
         });
 
         clearInterval(typingInterval);
@@ -466,4 +618,7 @@ client.on('messageCreate', async (message) => {
     }
 });
 
-client.login(process.env.DISCORD_TOKEN);
+client.login(process.env.DISCORD_TOKEN).catch((err) => {
+    console.error('[LOGIN ERROR]', err.message);
+    process.exit(1);
+});
