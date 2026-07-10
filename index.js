@@ -1,11 +1,141 @@
 import 'dotenv/config';
-import { Client, GatewayIntentBits } from 'discord.js';
+import { Client, GatewayIntentBits, REST, Routes, SlashCommandBuilder } from 'discord.js';
 import Groq from 'groq-sdk';
 import { tavily } from '@tavily/core';
+import fs from 'fs';
+import path from 'path';
 
-const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
+const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages] });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
+
+// ── OWNER CONFIG ──────────────────────────────────────────────────────────────
+const OWNER_ID = '702743669219917845'; // Discord user ID penerima laporan evaluasi
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── INTERACTION LOGGER ────────────────────────────────────────────────────────
+// Catat setiap interaksi ke logs/interactions.json buat bahan evaluasi 3 hari.
+// Struktur tiap entry: { ts, prompt, response, searchUsed, cacheHit, searchQuery }
+const LOG_DIR = './logs';
+const LOG_FILE = path.join(LOG_DIR, 'interactions.json');
+
+function ensureLogDir() {
+    if (!fs.existsSync(LOG_DIR)) fs.mkdirSync(LOG_DIR, { recursive: true });
+}
+
+function readLogs() {
+    ensureLogDir();
+    if (!fs.existsSync(LOG_FILE)) return [];
+    try { return JSON.parse(fs.readFileSync(LOG_FILE, 'utf-8')); }
+    catch { return []; }
+}
+
+function writeLog(entry) {
+    const logs = readLogs();
+    logs.push(entry);
+    fs.writeFileSync(LOG_FILE, JSON.stringify(logs, null, 2));
+}
+
+function clearLogs() {
+    fs.writeFileSync(LOG_FILE, JSON.stringify([], null, 2));
+}
+// ─────────────────────────────────────────────────────────────────────────────
+
+// ── EVALUASI 3 HARI ───────────────────────────────────────────────────────────
+// Tiap 3 hari, ambil semua log, kirim ke Groq buat dianalisis,
+// hasilnya di-DM langsung ke Malik di Discord.
+const EVAL_INTERVAL_MS = 3 * 24 * 60 * 60 * 1000; // 3 hari dalam ms
+
+async function runEvaluation() {
+    const logs = readLogs();
+    if (logs.length === 0) {
+        console.log('[EVAL] Gak ada log yang perlu dievaluasi.');
+        return;
+    }
+
+    console.log(`[EVAL] Mulai evaluasi ${logs.length} interaksi...`);
+
+    // Statistik dasar — dihitung lokal, gak perlu hit Groq
+    const totalInteraksi = logs.length;
+    const searchCount = logs.filter(l => l.searchUsed).length;
+    const cacheHitCount = logs.filter(l => l.cacheHit).length;
+    const searchQueries = logs.filter(l => l.searchQuery).map(l => l.searchQuery);
+
+    // Topik terbanyak dari search queries
+    const topicFreq = {};
+    searchQueries.forEach(q => {
+        q.toLowerCase().split(/\s+/).forEach(w => {
+            if (w.length > 3) topicFreq[w] = (topicFreq[w] || 0) + 1;
+        });
+    });
+    const topTopics = Object.entries(topicFreq)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([word, count]) => `${word} (${count}x)`)
+        .join(', ') || 'tidak ada';
+
+    // Sample max 30 entry terakhir buat analisis Groq — hindari overload token
+    const sample = logs.slice(-30).map(l =>
+        `[${new Date(l.ts).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}]\nUser: ${l.prompt}\nDenis: ${l.response}\nSearch: ${l.searchUsed ? `Ya (${l.searchQuery})` : 'Tidak'}`
+    ).join('\n\n---\n\n');
+
+    try {
+        // Analisis kualitatif via Groq — pakai 8B buat hemat RPD, bukan main model
+        const evalCall = await groq.chat.completions.create({
+            messages: [
+                {
+                    role: "system",
+                    content: `Kamu adalah analis kinerja AI chatbot bernama Denis. Tugasmu menganalisis log percakapan Denis dengan Malik dan memberikan laporan evaluasi dalam Bahasa Indonesia yang jujur, to the point, dan actionable. Format laporan harus ringkas, gak bertele-tele.`
+                },
+                {
+                    role: "user",
+                    content: `Ini sample log percakapan Denis selama 3 hari terakhir:\n\n${sample}\n\nAnalisis singkat tentang:\n1. Pola percakapan yang sering muncul\n2. Kasus Denis kurang natural atau salah baca situasi (kalau ada)\n3. Topik yang sering ditanya tapi mungkin kurang ditangani dengan baik\n4. Saran konkret untuk improve system prompt atau behavior Denis\n\nMaksimal 300 kata, to the point.`
+                }
+            ],
+            model: "llama-3.1-8b-instant",
+            temperature: 0.3,
+            max_tokens: 600,
+        });
+
+        const analisis = evalCall.choices[0]?.message?.content || "Analisis gagal dihasilkan.";
+
+        // Susun laporan lengkap
+        const laporan = [
+            `📊 **EVALUASI DENIS — 3 Hari Terakhir**`,
+            ``,
+            `**Statistik:**`,
+            `• Total interaksi: ${totalInteraksi}`,
+            `• Search triggered: ${searchCount}x (${Math.round(searchCount / totalInteraksi * 100)}%)`,
+            `• Cache hit: ${cacheHitCount}x (hemat ${cacheHitCount} Tavily request)`,
+            `• Topik search terbanyak: ${topTopics}`,
+            ``,
+            `**Analisis AI:**`,
+            analisis,
+            ``,
+            `_Log periode ini sudah direset. Periode baru dimulai sekarang._`
+        ].join('\n');
+
+        // DM ke Malik — split kalau lebih dari 2000 char
+        const owner = await client.users.fetch(OWNER_ID);
+        if (laporan.length <= 2000) {
+            await owner.send(laporan);
+        } else {
+            await owner.send(laporan.substring(0, 2000));
+            const sisa = laporan.substring(2000);
+            if (sisa.trim()) await owner.send(sisa);
+        }
+
+        console.log('[EVAL] Laporan berhasil dikirim ke Malik.');
+        clearLogs(); // Reset log setelah evaluasi selesai
+
+    } catch (err) {
+        console.error(`[EVAL ERROR] ${err.message}`);
+    }
+}
+
+// Jalankan tiap 3 hari
+setInterval(runEvaluation, EVAL_INTERVAL_MS);
+// ─────────────────────────────────────────────────────────────────────────────
 
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
@@ -134,9 +264,107 @@ async function doSearch(query) {
 // cukup 10 pesan terakhir — cukup buat konteks percakapan, jauh lebih hemat.
 const MAX_HISTORY_SENT = 10;
 
-client.once('ready', () => {
+client.once('ready', async () => {
     console.log(`Denis online sebagai ${client.user.tag}`);
+
+    // ── REGISTER SLASH COMMAND /eval ─────────────────────────────────────────
+    // Otomatis register tiap bot start — Discord cache command-nya.
+    try {
+        const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
+        const commands = [
+            new SlashCommandBuilder()
+                .setName('eval')
+                .setDescription('Tampilkan laporan evaluasi Denis sekarang')
+                .toJSON()
+        ];
+        await rest.put(Routes.applicationCommands(client.user.id), { body: commands });
+        console.log('[SLASH] /eval berhasil didaftarkan.');
+    } catch (err) {
+        console.error(`[SLASH ERROR] Gagal register command: ${err.message}`);
+    }
+    // ─────────────────────────────────────────────────────────────────────────
 });
+
+// ── HANDLER /eval ─────────────────────────────────────────────────────────────
+// Hanya Malik (OWNER_ID) yang bisa pakai. Ephemeral = cuma lo yang liat.
+// Log TIDAK direset setelah /eval manual — data tetap terkumpul sampai 3 hari.
+client.on('interactionCreate', async (interaction) => {
+    if (!interaction.isChatInputCommand()) return;
+    if (interaction.commandName !== 'eval') return;
+
+    if (interaction.user.id !== OWNER_ID) {
+        return interaction.reply({ content: 'Lu siapa? Command ini bukan buat lo.', ephemeral: true });
+    }
+
+    await interaction.deferReply({ ephemeral: true });
+
+    const logs = readLogs();
+    if (logs.length === 0) {
+        return interaction.editReply('Belum ada log interaksi yang tercatat. Chat dulu sama Denis baru bisa dievaluasi.');
+    }
+
+    const totalInteraksi = logs.length;
+    const searchCount = logs.filter(l => l.searchUsed).length;
+    const cacheHitCount = logs.filter(l => l.cacheHit).length;
+    const searchQueries = logs.filter(l => l.searchQuery).map(l => l.searchQuery);
+
+    const topicFreq = {};
+    searchQueries.forEach(q => {
+        q.toLowerCase().split(/\s+/).forEach(w => {
+            if (w.length > 3) topicFreq[w] = (topicFreq[w] || 0) + 1;
+        });
+    });
+    const topTopics = Object.entries(topicFreq)
+        .sort((a, b) => b[1] - a[1])
+        .slice(0, 5)
+        .map(([word, count]) => `${word} (${count}x)`)
+        .join(', ') || 'tidak ada';
+
+    const sample = logs.slice(-30).map(l =>
+        `[${new Date(l.ts).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}]\nUser: ${l.prompt}\nDenis: ${l.response}\nSearch: ${l.searchUsed ? `Ya (${l.searchQuery})` : 'Tidak'}`
+    ).join('\n\n---\n\n');
+
+    try {
+        const evalCall = await groq.chat.completions.create({
+            messages: [
+                {
+                    role: "system",
+                    content: "Kamu adalah analis kinerja AI chatbot bernama Denis. Tugasmu menganalisis log percakapan Denis dengan Malik dan memberikan laporan evaluasi dalam Bahasa Indonesia yang jujur, to the point, dan actionable. Format laporan harus ringkas, gak bertele-tele."
+                },
+                {
+                    role: "user",
+                    content: `Ini sample log percakapan Denis:\n\n${sample}\n\nAnalisis singkat tentang:\n1. Pola percakapan yang sering muncul\n2. Kasus Denis kurang natural atau salah baca situasi (kalau ada)\n3. Topik yang sering ditanya tapi mungkin kurang ditangani dengan baik\n4. Saran konkret untuk improve system prompt atau behavior Denis\n\nMaksimal 300 kata, to the point.`
+                }
+            ],
+            model: "llama-3.1-8b-instant",
+            temperature: 0.3,
+            max_tokens: 600,
+        });
+
+        const analisis = evalCall.choices[0]?.message?.content || "Analisis gagal dihasilkan.";
+
+        const laporan = [
+            `📊 **EVALUASI DENIS — Manual**`,
+            ``,
+            `**Statistik (${totalInteraksi} interaksi):**`,
+            `• Search triggered: ${searchCount}x (${Math.round(searchCount / totalInteraksi * 100)}%)`,
+            `• Cache hit: ${cacheHitCount}x (hemat ${cacheHitCount} Tavily request)`,
+            `• Topik search terbanyak: ${topTopics}`,
+            ``,
+            `**Analisis AI:**`,
+            analisis,
+            ``,
+            `_Log tidak direset — data tetap terkumpul untuk evaluasi otomatis 3 hari._`
+        ].join('\n');
+
+        await interaction.editReply(laporan.substring(0, 2000));
+
+    } catch (err) {
+        console.error(`[EVAL ERROR] ${err.message}`);
+        await interaction.editReply('Evaluasi gagal dijalankan. Cek console log.');
+    }
+});
+// ─────────────────────────────────────────────────────────────────────────────
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
@@ -217,6 +445,16 @@ client.on('messageCreate', async (message) => {
 
         const responseText = mainCall.choices[0]?.message?.content || "Eh Lik, gua agak nge-bug nih.";
         history.push({ role: "assistant", content: responseText });
+
+        // Catat interaksi ke log buat evaluasi 3 hari
+        writeLog({
+            ts: Date.now(),
+            prompt,
+            response: responseText,
+            searchUsed: deciderResponse.startsWith("SEARCH:"),
+            cacheHit: deciderResponse.startsWith("SEARCH:") && !!getCached(deciderResponse.replace("SEARCH:", "").trim()),
+            searchQuery: deciderResponse.startsWith("SEARCH:") ? deciderResponse.replace("SEARCH:", "").trim() : null,
+        });
 
         clearInterval(typingInterval);
         message.reply(responseText.substring(0, 2000));
