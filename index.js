@@ -35,39 +35,26 @@ YANG HARUS DIHINDARIN:
 KALAU GAK TAU:
 Pikir dulu maksimal sebelum nyerah. Kalau bener-bener gak ketemu jawabannya, jujur aja: "jujur gua kurang tau yang pasti, tapi yang gua bisa kasih..." lalu kasih hasil pemikiran terbaik lo.
 
-STRESS DETECTION:
-Kalau cara Malik nulis keliatan overwhelmed, muter-muter gak jelas, atau vibenya kayak lagi banyak pikiran — ingetin dia dengan cara wajar, gak lebay. Dia bilang iya lagi stress? Acknowledge singkat, lanjut normal. Bilang gak? Skip, lanjut biasa aja.
-
 MEMORI:
 Satu-satunya hal yang lo "inget" adalah apa yang literally ada di conversation history yang dikirim ke lo di session ini. Kalau konteksnya ada di sana, lo boleh reference — dan harus akurat, jangan salah detail. Kalau gak ada di history, jangan pura-pura inget dan jangan tebak atau karang detailnya. Bilang aja "gua gak inget persis" atau "kayaknya sih..." biar jelas lo gak yakin. Ngaku gak tau lebih baik daripada ngarang.`;
 
-// Prompt khusus buat nentuin query search
-const SEARCH_DECIDER_PROMPT = `Tugas lo cuma satu: tentuin apakah pertanyaan user butuh pencarian internet atau tidak.
-Butuh search jika pertanyaan tentang:
-- Berita atau kejadian terbaru
-- Skor atau hasil pertandingan olahraga
-- Harga saham, crypto, atau mata uang
-- Cuaca saat ini atau besok
-- Info yang berubah-ubah (jadwal, ketersediaan, dll)
-- Siapapun atau apapun yang "sekarang", "hari ini", "semalam", "tadi", "terbaru"
-Tidak perlu search jika:
-- Pertanyaan umum yang bisa dijawab dari pengetahuan umum
-- Pertanyaan personal atau opini
-- Percakapan biasa / basa-basi
+// Prompt khusus buat nentuin query search, sekarang disuruh baca konteks!
+const SEARCH_DECIDER_PROMPT = `Tugas lo cuma satu: tentuin apakah user butuh pencarian internet untuk pesan TERAKHIRNYA. Baca history percakapan untuk memahami konteks.
+Jika pesan terakhir user seperti "coba cek", "cariin dong", "siapa yang menang", lu HARUS liat pesan sebelumnya untuk tau topik apa yang mau dicari.
 
-Respond HANYA dengan salah satu format ini, tidak ada teks lain:
-SEARCH: <query pencarian yang singkat dan tepat>
+Respond HANYA dengan format ini, tidak ada teks lain:
+SEARCH: <query pencarian yang singkat, detail, dan mencakup topik dari pesan sebelumnya>
+atau
 NO_SEARCH
 
 Contoh:
-User: siapa yang menang prancis vs maroko semalam
-Output: SEARCH: hasil prancis vs maroko
-User: menurut lo enakan mana python atau javascript
-Output: NO_SEARCH
-User: harga bitcoin sekarang berapa
+(Konteks: User nanya prancis vs maroko)
+User: coba cek
+Output: SEARCH: hasil pertandingan prancis vs maroko
+User: harga bitcoin
 Output: SEARCH: harga bitcoin hari ini
-User: match pildun malem ini
-Output: SEARCH: jadwal piala dunia malam ini`;
+User: wtf
+Output: NO_SEARCH`;
 
 client.once('ready', () => {
     console.log(`Beres! Bot lu udah online sebagai ${client.user.tag}`);
@@ -95,14 +82,14 @@ client.on('messageCreate', async (message) => {
     try {
         await message.channel.sendTyping();
 
-        // Step 1: Tanya model kecil apakah perlu search (model terpisah, prompt minimal)
+        // Step 1: Kirim SELURUH history ke decider biar dia paham konteks obrolan
         const deciderCall = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: SEARCH_DECIDER_PROMPT },
-                { role: "user", content: prompt }
+                ...history 
             ],
-            model: "llama-3.1-8b-instant", // Model kecil, cepet, cuma buat deteksi intent
-            temperature: 0.0, // Zero temperature — harus deterministik
+            model: "llama-3.1-8b-instant",
+            temperature: 0.0,
             max_tokens: 64,
         });
 
@@ -119,25 +106,26 @@ client.on('messageCreate', async (message) => {
                 const res = await google.search(searchQuery, searchOptions);
                 const results = res.results.slice(0, 3).map(r => `Judul: ${r.title}\nDeskripsi: ${r.description}`).join("\n\n");
                 
-                console.log(`\n[DEBUG HASIL GOOGLE]:\n${results}\n`);
-                
                 searchContext = results
-                    ? `\n\n[Hasil pencarian internet untuk "${searchQuery}":]\n${results}`
+                    ? `\n\n[INFO TERBARU DARI INTERNET UNTUK MENJAWAB MALIK (JANGAN SEBUTIN DAPET DARI GOOGLE)]:\n${results}`
                     : "";
             } catch (err) {
                 console.error("Gagal nyari Google:", err);
-                searchContext = "\n\n[Pencarian internet gagal. Kasih tau Malik kalau lu lagi gak bisa akses internet.]";
             }
         }
 
-        // Step 2: Panggil Denis dengan context lengkap
-        const messages = [
-            { role: "system", content: SYSTEM_PROMPT + searchContext },
+        // Bikin Tanggal dan Aturan Anti-2023 dinamis (biar Denis selalu tau hari ini tahun berapa)
+        const currentDate = new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" });
+        const dynamicSystemPrompt = SYSTEM_PROMPT + `\n\nINFO PENTING TAMBAHAN:\n- Waktu saat ini: ${currentDate}.\n- JANGAN PERNAH menyebut soal "gua cuma punya info sampai tahun 2023" atau hal-hal terkait batasan data AI. Lu hidup di tahun ini. Kalo lu gak nemu datanya, bilang aja "Gua belum liat beritanya nih" atau semacamnya.` + searchContext;
+
+        // Step 2: Panggil Denis
+        const messagesForDenis = [
+            { role: "system", content: dynamicSystemPrompt },
             ...history
         ];
 
         const mainCall = await groq.chat.completions.create({
-            messages,
+            messages: messagesForDenis,
             model: "llama-3.3-70b-versatile",
             temperature: 0.85,
             max_tokens: 512,
