@@ -119,6 +119,8 @@ client.on('messageCreate', async (message) => {
                 const res = await google.search(searchQuery, searchOptions);
                 const results = res.results.slice(0, 3).map(r => `Judul: ${r.title}\nDeskripsi: ${r.description}`).join("\n\n");
                 
+                console.log(`\n[DEBUG HASIL GOOGLE]:\n${results}\n`);
+                
                 searchContext = results
                     ? `\n\n[Hasil pencarian internet untuk "${searchQuery}":]\n${results}`
                     : "";
