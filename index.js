@@ -1,10 +1,11 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits } from 'discord.js';
 import Groq from 'groq-sdk';
-import google from 'googlethis';
+import { tavily } from '@tavily/core';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
+const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
 
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
@@ -32,10 +33,13 @@ YANG HARUS DIHINDARIN:
 - Alay, norak, atau antusias berlebihan untuk situasi biasa.
 - Jawaban kaku, template, atau baku kayak customer service.
 - Muter-muter, bertele-tele, atau buka topik yang gak diminta Malik.
-- Jangan pernah bilang "gua gak punya akses real-time" atau sejenisnya — kalau ada [HASIL PENCARIAN] di bawah, itu berarti lo udah punya datanya. Langsung jawab dari situ.
+- JANGAN PERNAH nyuruh Malik "cek sumber lain" atau "cari sendiri" — lo partner in crime-nya, bukan resepsionis.
 
-KALAU GAK TAU:
-Pikir dulu maksimal sebelum nyerah. Kalau bener-bener gak ketemu jawabannya, jujur aja: "jujur gua kurang tau yang pasti, tapi yang gua bisa kasih..." lalu kasih hasil pemikiran terbaik lo.
+KALAU GAK TAU ATAU PENCARIAN GAGAL:
+Pikir dulu maksimal. Kalau search gagal atau gak nemu hasil, bilang aja jujur: "gua gak nemu info spesifiknya sekarang" — lalu kasih apa yang lo tau dari pengetahuan lo, atau bilang gak tau. Jangan ngeless panjang-panjang, jangan suruh Malik cek tempat lain.
+
+KALAU ADA [HASIL PENCARIAN]:
+Itu data aktual dari internet. Jadiin referensi utama dan langsung jawab — gak usah bilang "gua gak punya akses real-time" atau sejenisnya, karena lo udah dapet datanya.
 
 STRESS DETECTION:
 Kalau cara Malik nulis keliatan overwhelmed, muter-muter gak jelas, atau vibenya kayak lagi banyak pikiran — ingetin dia dengan cara wajar, gak lebay. Dia bilang iya lagi stress? Acknowledge singkat, lanjut normal. Bilang gak? Skip, lanjut biasa aja.
@@ -43,7 +47,6 @@ Kalau cara Malik nulis keliatan overwhelmed, muter-muter gak jelas, atau vibenya
 MEMORI:
 Satu-satunya hal yang lo "inget" adalah apa yang literally ada di conversation history yang dikirim ke lo di session ini. Kalau konteksnya ada di sana, lo boleh reference — dan harus akurat, jangan salah detail. Kalau gak ada di history, jangan pura-pura inget dan jangan tebak atau karang detailnya. Bilang aja "gua gak inget persis" atau "kayaknya sih..." biar jelas lo gak yakin. Ngaku gak tau lebih baik daripada ngarang.`;
 
-// Decider: tentuin perlu search atau engga — model kecil, cepat, murah
 const SEARCH_DECIDER_PROMPT = `Tugasmu: tentukan apakah pesan user butuh pencarian internet atau tidak.
 Kalau butuh, buat query pencarian yang bersih — hapus kata waktu relatif (semalam, kemarin, hari ini, sekarang, tadi, malem ini) dan ambil inti subjeknya saja.
 
@@ -52,49 +55,37 @@ SEARCH: <query bersih>
 NO_SEARCH
 
 Contoh:
+"score spanyol vs belgia malam ini" → SEARCH: hasil pertandingan spanyol vs belgia
 "siapa yang menang prancis vs maroko semalam?" → SEARCH: hasil pertandingan prancis vs maroko
 "cuaca bandung hari ini" → SEARCH: cuaca bandung
 "harga bitcoin sekarang" → SEARCH: harga bitcoin
 "halo" → NO_SEARCH
 "wtf" → NO_SEARCH
-"2+2 berapa" → NO_SEARCH
-"lo tau gak sih" → NO_SEARCH`;
+"2+2 berapa" → NO_SEARCH`;
 
-// Ambil semua tipe hasil dari googlethis, bukan cuma organic results
 async function doSearch(query) {
     try {
-        const options = { page: 0, safe: false, additional_params: { hl: 'id' } };
-        const res = await google.search(query, options);
+        const res = await tvly.search(query, {
+            maxResults: 4,
+            searchDepth: "basic",
+            includeAnswer: true,
+        });
+
         const parts = [];
 
-        // Answer box — paling relevan untuk skor, konversi, fakta cepat
-        if (res.answer_box) {
-            const ab = res.answer_box;
-            const text = ab.snippet || ab.description || ab.result || '';
-            if (text) parts.push(`[Jawaban Langsung] ${text}`);
-        }
+        // Kalau Tavily kasih direct answer, prioritasin itu
+        if (res.answer) parts.push(`[Jawaban] ${res.answer}`);
 
-        // Weather — field khusus dari googlethis
-        if (res.weather) {
-            const w = res.weather;
-            parts.push(`[Cuaca] ${w.location}: ${w.condition}, ${w.temperature}, kelembaban ${w.humidity}`);
-        }
-
-        // Knowledge panel
-        if (res.knowledge_panel?.description) {
-            parts.push(`[Info] ${res.knowledge_panel.description}`);
-        }
-
-        // Organic results — maks 3
+        // Tambahin hasil individual
         if (res.results?.length > 0) {
-            res.results.slice(0, 3).forEach(r => {
-                if (r.title && r.description) parts.push(`${r.title}: ${r.description}`);
+            res.results.forEach(r => {
+                if (r.title && r.content) parts.push(`${r.title}: ${r.content}`);
             });
         }
 
         return parts.filter(Boolean).join('\n') || null;
     } catch (err) {
-        console.error('[SEARCH ERROR]', err.message);
+        console.error(`[SEARCH ERROR] ${err.message}`);
         return null;
     }
 }
@@ -120,7 +111,7 @@ client.on('messageCreate', async (message) => {
     try {
         await message.channel.sendTyping();
 
-        // Step 1: Decider — kirim HANYA pesan terbaru, bukan full history (hemat token)
+        // Step 1: Decider — cukup pesan terbaru, hemat token
         const deciderCall = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: SEARCH_DECIDER_PROMPT },
@@ -140,15 +131,17 @@ client.on('messageCreate', async (message) => {
             const query = deciderResponse.replace("SEARCH:", "").trim();
             console.log(`[SEARCH] Query: ${query}`);
             const results = await doSearch(query);
+
             if (results) {
                 searchContext = `\n\n[HASIL PENCARIAN untuk "${query}"]:\n${results}`;
-                console.log(`[SEARCH] Hasil dapet`);
+                console.log(`[SEARCH] Berhasil`);
             } else {
-                console.log(`[SEARCH] Gak ada hasil`);
+                searchContext = `\n\n[PENCARIAN "${query}" tidak berhasil — gak ada data yang ketemu. Jujur aja ke Malik kalau lo gak nemu infonya, kasih apa yang lo tau dari pengetahuan lo kalo ada, dan JANGAN suruh dia cek sumber lain.]`;
+                console.log(`[SEARCH] Gagal`);
             }
         }
 
-        // Step 3: Final system prompt — SYSTEM_PROMPT + waktu + hasil search (kalau ada)
+        // Step 3: Final system prompt
         const currentDate = new Date().toLocaleString("id-ID", { timeZone: "Asia/Jakarta" });
         const finalSystemPrompt = SYSTEM_PROMPT
             + `\n\nWaktu sekarang: ${currentDate}.`

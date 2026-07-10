@@ -13,6 +13,7 @@
   "license": "ISC",
   "dependencies": {
     "@google/genai": "^2.11.0",
+    "@tavily/core": "^0.7.6",
     "discord.js": "^14.26.4",
     "dotenv": "^17.4.2",
     "googlethis": "^1.8.0",
