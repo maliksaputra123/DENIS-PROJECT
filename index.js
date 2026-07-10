@@ -99,7 +99,7 @@ client.on('messageCreate', async (message) => {
                 { role: "system", content: SYSTEM_PROMPT },
                 ...history
             ],
-            model: "llama-3.3-70b-versatile",
+            model: "llama-3.1-70b-versatile",
             temperature: 0.1, // Suhu rendah biar gak typo pas manggil fungsi
             max_tokens: 512,
             tools: tools,           
