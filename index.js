@@ -97,7 +97,7 @@ client.on('messageCreate', async (message) => {
                 ...history
             ],
             model: "llama-3.3-70b-versatile",
-            temperature: 0.85,
+            temperature: 0.1,
             max_tokens: 512,
             tools: tools,           // Masukin tools ke AI
             tool_choice: "auto",    // Biarin AI milih sendiri butuh tool atau gak
