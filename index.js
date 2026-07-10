@@ -77,7 +77,7 @@ client.on('messageCreate', async (message) => {
                 { role: "system", content: SYSTEM_PROMPT },
                 ...history
             ],
-            model: "openai/gpt-oss-120b",
+            model: "llama-3.3-70b-versatile",
             temperature: 0.85,
             max_tokens: 512, // Hemat token — Denis harusnya concise by default
         });
