@@ -64,7 +64,8 @@ const tools = [
     }
 ];
 
-client.once('ready', () => {
+// FIX: Ganti 'ready' -> 'clientReady' buat ilangin DeprecationWarning
+client.once('clientReady', () => {
     console.log(`Beres! Bot lu udah online sebagai ${client.user.tag}`);
 });
 
@@ -77,7 +78,6 @@ client.on('messageCreate', async (message) => {
 
     const userId = message.author.id;
 
-    // Init history kalo user baru
     if (!conversationHistory.has(userId)) {
         conversationHistory.set(userId, []);
     }
@@ -85,7 +85,6 @@ client.on('messageCreate', async (message) => {
     const history = conversationHistory.get(userId);
     history.push({ role: "user", content: prompt });
 
-    // Trim kalo udah kelewat panjang, buang dari depan
     while (history.length > MAX_HISTORY) {
         history.shift();
     }
@@ -93,49 +92,54 @@ client.on('messageCreate', async (message) => {
     try {
         await message.channel.sendTyping();
 
-        // Panggilan Pertama: Nanya ke Groq, butuh Googling gak nih?
+        // FIX: Ganti model ke llama-3.3-70b-versatile — lebih stabil buat tool calling
         let chatCompletion = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: SYSTEM_PROMPT },
                 ...history
             ],
-            model: "llama-3.1-70b-versatile",
-            temperature: 0.1, // Suhu rendah biar gak typo pas manggil fungsi
+            model: "llama-3.3-70b-versatile",
+            temperature: 0.1,
             max_tokens: 512,
-            tools: tools,           
-            tool_choice: "auto",    
-            parallel_tool_calls: false // Fix bug Error 400 dari server Groq
+            tools: tools,
+            tool_choice: "auto",
+            parallel_tool_calls: false
         });
 
         let responseMessage = chatCompletion.choices[0]?.message;
 
-        // Cek apakah AI memutuskan buat manggil fungsi 'search_web'
-        if (responseMessage.tool_calls) {
+        if (responseMessage?.tool_calls && responseMessage.tool_calls.length > 0) {
             const toolCall = responseMessage.tool_calls[0];
-            const functionArgs = JSON.parse(toolCall.function.arguments);
-            const searchQuery = functionArgs.query;
+
+            // FIX: Validasi JSON sebelum di-parse biar gak langsung crash
+            let searchQuery = "";
+            try {
+                const functionArgs = JSON.parse(toolCall.function.arguments);
+                searchQuery = functionArgs.query;
+            } catch (parseError) {
+                console.error("[ERROR] Gagal parse tool arguments:", toolCall.function.arguments);
+                // Fallback: coba extract query manual dari string mentah
+                const match = toolCall.function.arguments.match(/"query"\s*:\s*"([^"]+)"/);
+                searchQuery = match ? match[1] : prompt;
+            }
 
             console.log(`[LOG] Denis lagi nyari di web: ${searchQuery}`);
 
-            // Proses pencarian ke Google
             let searchResultText = "";
             try {
                 const searchOptions = { page: 0, safe: false, additional_params: { hl: 'id' } };
                 const res = await google.search(searchQuery, searchOptions);
-                
-                // Ambil 3 hasil paling atas biar hemat token
                 searchResultText = res.results.slice(0, 3).map(r => `Judul: ${r.title}\nDeskripsi: ${r.description}`).join("\n\n");
-                if(!searchResultText) searchResultText = "Tidak ditemukan hasil di Google.";
+                if (!searchResultText) searchResultText = "Tidak ditemukan hasil di Google.";
             } catch (err) {
                 console.error("Gagal nyari Google:", err);
                 searchResultText = "Gagal mengakses internet. Kasih tau Malik kalo jaringan lagi error.";
             }
 
-            // Panggilan Kedua: Ngirim hasil Googling ke Denis biar dirangkum
             const messagesForSecondCall = [
                 { role: "system", content: SYSTEM_PROMPT },
                 ...history,
-                responseMessage, // Pesen dari AI yang minta tool call (Wajib disertain)
+                responseMessage,
                 {
                     tool_call_id: toolCall.id,
                     role: "tool",
@@ -147,7 +151,7 @@ client.on('messageCreate', async (message) => {
             const secondCall = await groq.chat.completions.create({
                 messages: messagesForSecondCall,
                 model: "llama-3.3-70b-versatile",
-                temperature: 0.85, // Suhu balikin tinggi biar jawabnya asik lagi
+                temperature: 0.85,
                 max_tokens: 512,
             });
 
@@ -156,7 +160,6 @@ client.on('messageCreate', async (message) => {
 
         const replyText = responseMessage?.content || "Eh Lik, gua agak nge-bug nih, gak dapet respon dari server.";
 
-        // Tambahin respon Denis ke history
         history.push({ role: "assistant", content: replyText });
 
         message.reply(replyText.substring(0, 2000));
