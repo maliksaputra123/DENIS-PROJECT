@@ -93,6 +93,8 @@ client.on('messageCreate', async (message) => {
 
         let responseText = firstCall.choices[0]?.message?.content || "";
 
+        console.log(`[DEBUG] Response pertama: ${responseText}`);
+
         // Cek apakah model minta search
         if (responseText.trim().startsWith("SEARCH_WEB:")) {
             const searchQuery = responseText.replace("SEARCH_WEB:", "").trim();
