@@ -152,14 +152,24 @@ client.on('messageCreate', async (message) => {
     history.push({ role: "user", content: prompt });
     while (history.length > MAX_HISTORY) history.shift();
 
-    try {
-        await message.channel.sendTyping();
+    // ── TYPING PERSIST ────────────────────────────────────────────────────────
+    // Re-send typing indicator tiap 8 detik sampai response keluar.
+    // Discord auto-clear typing setelah 10 detik, jadi ini pastiin
+    // Malik tetap liat "bot lagi ngetik" selama proses berjalan.
+    await message.channel.sendTyping();
+    const typingInterval = setInterval(() => message.channel.sendTyping(), 8000);
 
-        // Step 1: Decider
+    try {
+        // Step 1: Decider — kasih 3 pesan terakhir sebagai konteks
+        // Ini bikin decider bisa baca follow-up question dengan bener,
+        // misal "terus hasilnya?" setelah nanya soal bitcoin → tetap SEARCH bitcoin.
+        const deciderContext = history.slice(-3).map(m => `${m.role === "user" ? "User" : "Denis"}: ${m.content}`).join('\n');
+        const deciderInput = `Konteks percakapan terakhir:\n${deciderContext}\n\nPesan terbaru user: ${prompt}`;
+
         const deciderCall = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: SEARCH_DECIDER_PROMPT },
-                { role: "user", content: prompt }
+                { role: "user", content: deciderInput }
             ],
             model: "llama-3.1-8b-instant",
             temperature: 0.0,
@@ -192,12 +202,15 @@ client.on('messageCreate', async (message) => {
             + searchContext;
 
         // Step 4: Main call — kirim hanya slice terakhir dari history
+        // qwen/qwen3-32b: lebih capable dari llama-3.3-70b untuk nuance, persona, dan multilingual
+        // reasoning_effort: "none" → matiin thinking mode bawaan Qwen3, hemat token untuk chatting casual
         const mainCall = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: finalSystemPrompt },
                 ...history.slice(-MAX_HISTORY_SENT)
             ],
-            model: "llama-3.3-70b-versatile",
+            model: "qwen/qwen3-32b",
+            reasoning_effort: "none",
             temperature: 0.85,
             max_tokens: 512,
         });
@@ -205,9 +218,11 @@ client.on('messageCreate', async (message) => {
         const responseText = mainCall.choices[0]?.message?.content || "Eh Lik, gua agak nge-bug nih.";
         history.push({ role: "assistant", content: responseText });
 
+        clearInterval(typingInterval);
         message.reply(responseText.substring(0, 2000));
 
     } catch (error) {
+        clearInterval(typingInterval);
         console.error("[ERROR]", error);
         message.reply("Aduh Lik, otak gua nge-hang bentar. Coba chat lagi.");
     }
