@@ -5,7 +5,6 @@ import Groq from 'groq-sdk';
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
-const TARGET_CHANNEL = process.env.ALLOWED_CHANNEL_ID;
 
 // Memory per user — reset tiap bot restart
 const conversationHistory = new Map();
@@ -50,7 +49,6 @@ client.once('ready', () => {
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
-    if (message.channel.id !== TARGET_CHANNEL) return;
     if (!message.mentions.has(client.user)) return;
 
     const prompt = message.content.replace(`<@${client.user.id}>`, '').trim();
