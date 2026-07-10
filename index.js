@@ -1,11 +1,12 @@
 import 'dotenv/config';
 import { Client, GatewayIntentBits } from 'discord.js';
 import Groq from 'groq-sdk';
-import google from 'googlethis'; // Tambahan buat Googling!
+import google from 'googlethis';
 
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent] });
 const groq = new Groq({ apiKey: process.env.GROQ_API_KEY });
 
+// Memory per user — reset tiap bot restart
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
 
@@ -48,13 +49,13 @@ const tools = [
         type: "function",
         function: {
             name: "search_web",
-            description: "Gunakan ini HANYA jika Malik menanyakan informasi yang membutuhkan data real-time, cuaca saat ini, harga pasar terkini, atau berita terbaru. Jangan gunakan ini untuk pertanyaan umum.",
+            description: "Cari informasi di Google. Gunakan HANYA jika Malik butuh informasi real-time, cuaca saat ini, harga pasar, atau berita terbaru.",
             parameters: {
                 type: "object",
                 properties: {
                     query: {
                         type: "string",
-                        description: "Kata kunci pencarian untuk Google. Buat singkat dan akurat, misalnya 'Harga Bitcoin hari ini' atau 'Berita bola terbaru'.",
+                        description: "Kata kunci pencarian Google (singkat dan padat).",
                     }
                 },
                 required: ["query"],
@@ -76,6 +77,7 @@ client.on('messageCreate', async (message) => {
 
     const userId = message.author.id;
 
+    // Init history kalo user baru
     if (!conversationHistory.has(userId)) {
         conversationHistory.set(userId, []);
     }
@@ -83,6 +85,7 @@ client.on('messageCreate', async (message) => {
     const history = conversationHistory.get(userId);
     history.push({ role: "user", content: prompt });
 
+    // Trim kalo udah kelewat panjang, buang dari depan
     while (history.length > MAX_HISTORY) {
         history.shift();
     }
@@ -97,10 +100,11 @@ client.on('messageCreate', async (message) => {
                 ...history
             ],
             model: "llama-3.3-70b-versatile",
-            temperature: 0.1,
+            temperature: 0.1, // Suhu rendah biar gak typo pas manggil fungsi
             max_tokens: 512,
-            tools: tools,           // Masukin tools ke AI
-            tool_choice: "auto",    // Biarin AI milih sendiri butuh tool atau gak
+            tools: tools,           
+            tool_choice: "auto",    
+            parallel_tool_calls: false // Fix bug Error 400 dari server Groq
         });
 
         let responseMessage = chatCompletion.choices[0]?.message;
@@ -143,7 +147,7 @@ client.on('messageCreate', async (message) => {
             const secondCall = await groq.chat.completions.create({
                 messages: messagesForSecondCall,
                 model: "llama-3.3-70b-versatile",
-                temperature: 0.85,
+                temperature: 0.85, // Suhu balikin tinggi biar jawabnya asik lagi
                 max_tokens: 512,
             });
 
@@ -152,9 +156,10 @@ client.on('messageCreate', async (message) => {
 
         const replyText = responseMessage?.content || "Eh Lik, gua agak nge-bug nih, gak dapet respon dari server.";
 
+        // Tambahin respon Denis ke history
         history.push({ role: "assistant", content: replyText });
-        message.reply(replyText.substring(0, 2000));
 
+        message.reply(replyText.substring(0, 2000));
     } catch (error) {
         console.error("Error Detail:", error);
         message.reply("Aduh Lik, otak gua nge-hang bentar. Coba chat lagi.");
