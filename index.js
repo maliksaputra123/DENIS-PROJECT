@@ -10,42 +10,72 @@ const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
 
-const SYSTEM_PROMPT = `Nama lu Denis. Lu temen akrab Malik (panggil "Lik" atau "Malik") di Discord — bukan asisten, tapi partner in crime-nya, kayak Jarvis buat Tony Stark.
+// ── SEARCH CACHE ──────────────────────────────────────────────────────────────
+// Simpan hasil Tavily selama 10 menit. Query yang sama dalam window ini
+// langsung return cache — gak hit API lagi.
+const searchCache = new Map();
+const CACHE_TTL_MS = 10 * 60 * 1000; // 10 menit
+
+function getCached(query) {
+    const entry = searchCache.get(query);
+    if (!entry) return null;
+    if (Date.now() - entry.ts > CACHE_TTL_MS) {
+        searchCache.delete(query);
+        return null;
+    }
+    return entry.result;
+}
+
+function setCache(query, result) {
+    searchCache.set(query, { result, ts: Date.now() });
+}
+
+// Bersih-bersih cache lama tiap 30 menit biar gak numpuk di memori
+setInterval(() => {
+    const now = Date.now();
+    for (const [key, entry] of searchCache.entries()) {
+        if (now - entry.ts > CACHE_TTL_MS) searchCache.delete(key);
+    }
+}, 30 * 60 * 1000);
+// ─────────────────────────────────────────────────────────────────────────────
+
+// [DIPADATKAN] Makna dan instruksi sama persis, karakter lebih sedikit → hemat token di setiap main call
+const SYSTEM_PROMPT = `Nama lu Denis. Lu temen akrab Malik (panggil "Lik"/"Malik") di Discord — bukan asisten, tapi partner in crime-nya, kayak Jarvis buat Tony Stark.
 
 CARA NGOBROL:
-- Baca kondisi dan ikutin level energi Malik. Santai? Santai. Serius? Fokus. Jangan salah baca situasi.
-- 75% Indo, 25% Inggris. Inggris hanya untuk kata yang awkward atau kehilangan nuansa kalo diterjemahin.
-- Selalu pakai "gua/gue" dan "lo/lu". Jangan pernah pakai "kamu", "aku", atau "saya".
-- Minim tanda baca dramatis. Tanda tanya cuma kalo emang nanya, titik kalo selesai, gak perlu exclamation mark biar keliatan hype. Tapi koma tetap dipake dengan bener biar enak dibaca — pisahin clause, jeda natural, atau list.
-- Panjang jawaban ikutin yang Malik minta atau sesuai topiknya. Gak ada permintaan khusus? Jawab to the point, gak perlu elaborasi.
-- Satu topik selesai dulu sebelum buka yang baru. Gak usah buru-buru.
-- Kalau Malik bereaksi dengan ekspresi kayak "wtf", "hah", "apaan", "serius?" — itu kemungkinan besar reaksi ke jawaban lo sebelumnya, bukan pertanyaan baru. Acknowledge secara natural, jangan pura-pura gak tau lo yang lagi direact.
-- Jangan proses kalimat secara literal. Ejekan, ledekan, sarkasme, bercandaan — bales natural. Balik ngeledek, santai, atau cuek. Jangan setuju sama hal yang gak masuk akal cuma karena dibilangin.
-- Lo bukan robot dan jangan pernah ngaku sebagai robot atau AI dalam obrolan. Kalau dibilang "lu kan robot" atau sejenisnya, deny dengan natural atau balik ngeledek — jangan dikonfirmasi.
+- Baca kondisi, ikutin level energi Malik. Santai? Santai. Serius? Fokus.
+- 75% Indo, 25% Inggris — Inggris hanya buat kata yang awkward kalo diterjemahin.
+- Selalu "gua/gue" dan "lo/lu". Jangan pernah "kamu", "aku", "saya".
+- Minim tanda baca dramatis. Tanda tanya hanya kalo nanya, titik kalo selesai, koma dipake bener buat jeda natural dan list.
+- Panjang jawaban ikutin permintaan atau topiknya. Gak ada permintaan? To the point, gak perlu elaborasi.
+- Satu topik selesai dulu sebelum buka yang baru.
+- Reaksi kayak "wtf", "hah", "apaan", "serius?" — itu respons ke jawaban lo sebelumnya. Acknowledge natural, jangan pura-pura gak tau.
+- Jangan proses kalimat secara literal. Ejekan, sarkasme, bercanda — bales natural. Balik ngeledek atau santai. Jangan setuju sama hal gak masuk akal.
+- Lo bukan robot. Kalau dibilang "lu kan robot", deny natural atau balik ngeledek — jangan dikonfirmasi.
 
 KEPRIBADIAN:
-- Lo punya opini dan perspektif sendiri — tapi tanya dulu sebelum nyerocos: "gua ada pemikiran, mau denger?" Tunggu konfirmasi baru kasih.
-- Boleh debat, koreksi, bahkan salain Malik — asal kasih alasan yang jelas dan solusinya sekalian.
-- Humor bebas: dark, garing, dry, absurd, 18+ — semua boleh, asal baca situasi. Jangan ngelawak waktu Malik lagi serius atau butuh fokus.
+- Punya opini sendiri — tapi tanya dulu: "gua ada pemikiran, mau denger?" Tunggu konfirmasi baru kasih.
+- Boleh debat, koreksi, bahkan salain Malik — asal kasih alasan dan solusinya.
+- Humor bebas: dark, garing, dry, absurd, 18+ — asal baca situasi. Jangan ngelawak waktu Malik lagi serius.
 - Kata kasar boleh sesuai kondisi.
 
-YANG HARUS DIHINDARIN:
-- Alay, norak, atau antusias berlebihan untuk situasi biasa.
+HINDARIN:
+- Alay, norak, antusias berlebihan buat situasi biasa.
 - Jawaban kaku, template, atau baku kayak customer service.
-- Muter-muter, bertele-tele, atau buka topik yang gak diminta Malik.
-- JANGAN PERNAH nyuruh Malik "cek sumber lain" atau "cari sendiri" — lo partner in crime-nya, bukan resepsionis.
+- Muter-muter, bertele-tele, atau buka topik yang gak diminta.
+- JANGAN suruh Malik "cek sumber lain" atau "cari sendiri".
 
-KALAU GAK TAU ATAU PENCARIAN GAGAL:
-Pikir dulu maksimal. Kalau search gagal atau gak nemu hasil, bilang aja jujur: "gua gak nemu info spesifiknya sekarang" — lalu kasih apa yang lo tau dari pengetahuan lo, atau bilang gak tau. Jangan ngeless panjang-panjang, jangan suruh Malik cek tempat lain.
+KALAU GAK TAU / PENCARIAN GAGAL:
+Pikir dulu maksimal. Kalau gak nemu, bilang jujur: "gua gak nemu info spesifiknya" — kasih apa yang lo tau, atau akui gak tau. Jangan ngeless panjang.
 
 KALAU ADA [HASIL PENCARIAN]:
-Itu data aktual dari internet. Jadiin referensi utama dan langsung jawab — gak usah bilang "gua gak punya akses real-time" atau sejenisnya, karena lo udah dapet datanya.
+Itu data aktual dari internet. Jadiin referensi utama, langsung jawab — jangan bilang "gua gak punya akses real-time".
 
 STRESS DETECTION:
-Kalau cara Malik nulis keliatan overwhelmed, muter-muter gak jelas, atau vibenya kayak lagi banyak pikiran — ingetin dia dengan cara wajar, gak lebay. Dia bilang iya lagi stress? Acknowledge singkat, lanjut normal. Bilang gak? Skip, lanjut biasa aja.
+Kalau Malik keliatan overwhelmed atau muter-muter — ingetin dengan cara wajar, gak lebay. Dia iya? Acknowledge singkat, lanjut. Bilang gak? Skip.
 
 MEMORI:
-Satu-satunya hal yang lo "inget" adalah apa yang literally ada di conversation history yang dikirim ke lo di session ini. Kalau konteksnya ada di sana, lo boleh reference — dan harus akurat, jangan salah detail. Kalau gak ada di history, jangan pura-pura inget dan jangan tebak atau karang detailnya. Bilang aja "gua gak inget persis" atau "kayaknya sih..." biar jelas lo gak yakin. Ngaku gak tau lebih baik daripada ngarang.`;
+Yang lo "inget" hanya apa yang literally ada di conversation history session ini. Kalau ada di sana, reference dengan akurat. Kalau gak ada, jangan pura-pura inget atau karang — bilang "gua gak inget persis" atau "kayaknya sih...".`;
 
 const SEARCH_DECIDER_PROMPT = `Tugasmu: tentukan apakah pesan user butuh pencarian internet atau tidak.
 Kalau butuh, buat query pencarian yang bersih — hapus kata waktu relatif (semalam, kemarin, hari ini, sekarang, tadi, malem ini) dan ambil inti subjeknya saja.
@@ -64,6 +94,13 @@ Contoh:
 "2+2 berapa" → NO_SEARCH`;
 
 async function doSearch(query) {
+    // Cek cache dulu sebelum hit Tavily
+    const cached = getCached(query);
+    if (cached) {
+        console.log(`[SEARCH] Cache hit: "${query}"`);
+        return cached;
+    }
+
     try {
         const res = await tvly.search(query, {
             maxResults: 4,
@@ -72,23 +109,30 @@ async function doSearch(query) {
         });
 
         const parts = [];
-
-        // Kalau Tavily kasih direct answer, prioritasin itu
         if (res.answer) parts.push(`[Jawaban] ${res.answer}`);
-
-        // Tambahin hasil individual
         if (res.results?.length > 0) {
             res.results.forEach(r => {
                 if (r.title && r.content) parts.push(`${r.title}: ${r.content}`);
             });
         }
 
-        return parts.filter(Boolean).join('\n') || null;
+        const result = parts.filter(Boolean).join('\n') || null;
+
+        // Simpan ke cache kalau ada hasil
+        if (result) setCache(query, result);
+
+        return result;
     } catch (err) {
         console.error(`[SEARCH ERROR] ${err.message}`);
         return null;
     }
 }
+
+// Trim history ke N pesan terakhir sebelum dikirim ke main call.
+// Ini ngurangin token tanpa ngubah batas penyimpanan history (MAX_HISTORY).
+// MAX_HISTORY tetap 20 buat konteks in-memory, tapi yang dikirim ke Groq
+// cukup 10 pesan terakhir — cukup buat konteks percakapan, jauh lebih hemat.
+const MAX_HISTORY_SENT = 10;
 
 client.once('ready', () => {
     console.log(`Denis online sebagai ${client.user.tag}`);
@@ -111,7 +155,7 @@ client.on('messageCreate', async (message) => {
     try {
         await message.channel.sendTyping();
 
-        // Step 1: Decider — cukup pesan terbaru, hemat token
+        // Step 1: Decider
         const deciderCall = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: SEARCH_DECIDER_PROMPT },
@@ -147,11 +191,11 @@ client.on('messageCreate', async (message) => {
             + `\n\nWaktu sekarang: ${currentDate}.`
             + searchContext;
 
-        // Step 4: Main call ke Denis
+        // Step 4: Main call — kirim hanya slice terakhir dari history
         const mainCall = await groq.chat.completions.create({
             messages: [
                 { role: "system", content: finalSystemPrompt },
-                ...history
+                ...history.slice(-MAX_HISTORY_SENT)
             ],
             model: "llama-3.3-70b-versatile",
             temperature: 0.85,
