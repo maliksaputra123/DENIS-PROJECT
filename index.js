@@ -8,12 +8,8 @@ import { chatComplete, getProviderStatus } from './providers.js';
 const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBits.GuildMessages, GatewayIntentBits.MessageContent, GatewayIntentBits.DirectMessages] });
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
 
-// ── OWNER & CHANNEL CONFIG ────────────────────────────────────────────────────
+// ── OWNER CONFIG ──────────────────────────────────────────────────────────────
 const OWNER_ID = '702743669219917845'; // Discord user ID penerima laporan evaluasi
-
-// [BARU] Batasi Denis cuma nyaut di channel ini kalau di-set. DM tetep selalu boleh.
-// Kalau lu gak mau batasan channel, kosongin ALLOWED_CHANNEL_ID di .env aja.
-const ALLOWED_CHANNEL_ID = process.env.ALLOWED_CHANNEL_ID || null;
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── GLOBAL SAFETY NET ─────────────────────────────────────────────────────────
@@ -367,7 +363,6 @@ async function doSearch(query) {
 client.once('ready', async () => {
     console.log(`Denis online sebagai ${client.user.tag}`);
     console.log('[PROVIDERS]', getProviderStatus().map(s => `${s.name}${s.configured ? '' : ' (no key)'}`).join(', '));
-    if (ALLOWED_CHANNEL_ID) console.log(`[CHANNEL] Denis dibatasi ke channel ${ALLOWED_CHANNEL_ID} (DM tetep boleh).`);
 
     try {
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
@@ -422,9 +417,6 @@ client.on('interactionCreate', async (interaction) => {
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     if (!message.mentions.has(client.user)) return;
-
-    // [BARU] Batasi ke channel tertentu (DM tetep boleh). message.guild null = DM.
-    if (ALLOWED_CHANNEL_ID && message.guild && message.channel.id !== ALLOWED_CHANNEL_ID) return;
 
     const prompt = message.content.replace(`<@${client.user.id}>`, '').trim();
     if (!prompt) return message.reply("Ada yang bisa gua bantu, Lik?");
