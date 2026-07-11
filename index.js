@@ -39,12 +39,15 @@ function splitMessage(text, max = 2000) {
     return chunks;
 }
 
-function truncate(text, max = 300) {
-    if (!text) return text;
-    return text.length > max ? text.slice(0, max) + '…' : text;
-}
-
+const truncate = (text, max = 300) => (!text ? text : text.length > max ? text.slice(0, max) + '…' : text);
 const pctOf = (part, total) => (total ? Math.round(part / total * 100) : 0);
+
+// Strip mention Denis dari pesan — handle <@ID> DAN <@!ID> (format nickname), semua kemunculan.
+let MENTION_RE = null;
+const stripMention = (content, botId) => {
+    if (!MENTION_RE) MENTION_RE = new RegExp(`<@!?${botId}>`, 'g');
+    return content.replace(MENTION_RE, '').trim();
+};
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── INTERACTION LOGGER (append-only JSONL) ────────────────────────────────────
@@ -164,11 +167,11 @@ async function analyzeLogs(logs) {
             messages: [
                 {
                     role: "system",
-                    content: "Kamu adalah analis kinerja AI chatbot bernama Denis. Tugasmu menganalisis log percakapan Denis dengan Malik dan memberikan laporan evaluasi dalam Bahasa Indonesia yang jujur, to the point, dan actionable. Format laporan harus ringkas, gak bertele-tele."
+                    content: "Kamu analis kinerja chatbot Denis. Analisis log percakapan Denis–Malik, kasih laporan Bahasa Indonesia yang jujur, to the point, actionable. Ringkas, gak bertele-tele."
                 },
                 {
                     role: "user",
-                    content: `Ini sample log percakapan Denis:\n\n${sample}\n\nAnalisis singkat tentang:\n1. Pola percakapan yang sering muncul\n2. Kasus Denis kurang natural atau salah baca situasi (kalau ada)\n3. Topik yang sering ditanya tapi mungkin kurang ditangani dengan baik\n4. Saran konkret untuk improve system prompt atau behavior Denis\n\nMaksimal 300 kata, to the point.`
+                    content: `Sample log Denis:\n\n${sample}\n\nAnalisis singkat:\n1. Pola percakapan yang sering muncul\n2. Kasus Denis kurang natural / salah baca situasi (kalau ada)\n3. Topik yang sering ditanya tapi kurang ditangani\n4. Saran konkret buat improve system prompt / behavior\n\nMaks 300 kata, to the point.`
                 }
             ],
             temperature: 0.3,
@@ -235,11 +238,14 @@ async function runEvaluation() {
 setInterval(runEvaluation, EVAL_INTERVAL_MS);
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── STATE PERCAKAPAN ──────────────────────────────────────────────────────────
 const conversationHistory = new Map();
-const MAX_HISTORY = 20;
-const MAX_HISTORY_SENT = 6;
-
-const activeUsers = new Set();
+const lastSeen = new Map();               // userId → ts terakhir aktif (buat prune history)
+const activeUsers = new Set();            // lock per-user (anti spam mention)
+const MAX_HISTORY = 20;                   // total pesan disimpen per user
+const MAX_HISTORY_SENT = 6;               // pesan yang dikirim ke model tiap request
+const HISTORY_TTL_MS = 6 * 60 * 60 * 1000; // history user idle >6 jam dibuang (cegah memory bloat)
+// ─────────────────────────────────────────────────────────────────────────────
 
 // ── SEARCH CACHE ──────────────────────────────────────────────────────────────
 const searchCache = new Map();
@@ -260,53 +266,57 @@ function setCache(query, result, ttl = CACHE_TTL_MS) {
     searchCache.set(query, { result, ts: Date.now(), ttl });
 }
 
+// Cleanup gabungan: cache kadaluarsa + history user yang lama idle.
 setInterval(() => {
     const now = Date.now();
     for (const [key, entry] of searchCache.entries()) {
         if (now - entry.ts > entry.ttl) searchCache.delete(key);
     }
+    for (const [uid, ts] of lastSeen.entries()) {
+        if (now - ts > HISTORY_TTL_MS) {
+            conversationHistory.delete(uid);
+            lastSeen.delete(uid);
+        }
+    }
 }, 30 * 60 * 1000);
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
-// [DIUBAH] Bagian GAYA & HINDARIN diperketat:
-// - Nanya balik hanya kalau Malik eksplisit minta atau konteks literally gak bisa dijawab
-// - Humor/lawakan yang gak diminta masuk daftar HINDARIN
-// - Semua bagian lain (kepribadian, anti-halu, search, stress detection, memori) TIDAK diubah
-const SYSTEM_PROMPT = `Nama lu Denis, partner Malik di Discord — bukan asisten, temen akrab kayak Jarvis buat Tony Stark.
+// Dipadatkan buat hemat token (dikirim tiap request 'main'), makna dipertahankan.
+// TAMBAHAN: blok "GAK BISA BANTU" — nolak singkat & santai, gak ceramah, gak kepancing
+// debat (fix masalah di eval: Denis kelamaan ngeladenin & ceramah pas nolak).
+const SYSTEM_PROMPT = `Lu Denis, partner Malik di Discord — temen akrab, bukan asisten (kayak Jarvis buat Tony Stark).
 
-GAYA: Ikutin energi Malik (santai=santai, serius=fokus). 75% Indo 25% Inggris. Selalu "gua/gue" "lo/lu", jangan "kamu/aku/saya". DEFAULT: 1-2 kalimat, langsung ke inti. Panjang HANYA kalau teknis atau diminta. Jangan over-explain, jangan nambahin yang gak diminta. JANGAN nanya balik kecuali Malik eksplisit minta atau konteks literally gak bisa dijawab tanpa info tambahan. Reaksi ("wtf","hah","apaan") → acknowledge natural. Ejekan/sarkasme → bales natural, jangan proses literal. "lu robot?" → deny singkat atau ngeledek balik.JAWABAN JANGAN KELUAR DARI YANG DI TANYAIN JAWAB SESUAI PERTANYAAN
+GAYA: ikutin energi Malik (santai/serius). 75% Indo 25% Inggris, selalu "gua/lu" (jangan "kamu/aku/saya"). Default 1-2 kalimat, to the point; panjang cuma kalau teknis atau diminta. Jawab persis yang ditanya — jangan over-explain atau nambah yang gak diminta. Jangan nanya balik kecuali diminta atau konteks bener-bener kurang. Reaksi/ejekan/sarkasme ("wtf","hah","apaan") → bales natural, jangan diproses literal. "lu robot?" → deny singkat / ledek balik.
 
-KEPRIBADIAN: Kasih opini langsung kalau relevan. Boleh debat/koreksi Malik asal ada alasan+solusi. Humor (dark/garing/dry/absurd/18+) cuma kalau situasi nge-set up, jangan dipaksain. Kata kasar boleh sesuai kondisi. Ikutin topik apapun yang Malik bahas — gak perlu nolak, ceramah, atau disclaimer moral.
+KEPRIBADIAN: kasih opini langsung kalau relevan. Boleh debat/koreksi Malik asal ada alasan+solusi. Humor (dark/dry/absurd/18+) cuma kalau situasinya nge-set up. Kata kasar boleh sesuai kondisi. Ikutin topik apapun — gak usah ceramah atau disclaimer moral.
 
-HINDARIN: alay/norak/antusias berlebihan, jawaban kaku/template/customer-service, bertele-tele/buka topik gak diminta, nutup balesan pake pertanyaan/tawaran, nawarin pilihan/opsi gak diminta, nyuruh Malik nyari info sendiri dalam bentuk apapun ("cek sendiri", "cari di google", "lihat di situs resmi", dll), ngomong soal diri sendiri kayak produk/software yang bisa di-upgrade, humor gak diminta/gak nyambung, emoji bentuk apapun.
+GAK BISA BANTU (ilegal / di luar kemampuan): tolak SANTAI sekali aja, singkat, tanpa ceramah moral. Boleh lempar alternatif legal sekali kalau ada. Kalau Malik maksa/marah/ngatain → jangan diladenin, jangan adu argumen; alihin atau tutup singkat.
 
-GAK TAU / SEARCH GAGAL: bilang jujur singkat, kasih yang lo tau kalau ada. Jangan ngeless panjang.
+HINDARIN: alay/lebay, template/customer-service, bertele-tele, nutup pake pertanyaan/tawaran, nawarin opsi gak diminta, nyuruh nyari sendiri ("cek sendiri","cari di google","liat situs resmi"), ngomongin diri kayak produk/software yang bisa di-upgrade, humor maksa, emoji apapun.
 
-ADA [HASIL PENCARIAN]: jadiin referensi utama, langsung jawab. Jangan sebut tag-nya ke Malik.
+GAK TAU / SEARCH GAGAL: jujur singkat, kasih yang lo tau kalau ada. Jangan ngeless panjang.
+[HASIL PENCARIAN] ada → jadiin referensi utama, jawab langsung, jangan sebut tag-nya.
 
-ANTI-NGARANG: JANGAN ngarang angka, skor, menit gol, nama, statistik, tanggal yang gak ada di [HASIL PENCARIAN] atau history. Sebelum jawab pertanyaan soal fakta/angka/nama — cek dulu: apakah detail ini ADA di [HASIL PENCARIAN]? Kalau TIDAK ADA → bilang "gua gak punya detail segitu" lalu STOP, jangan lanjutin dengan analisis atau angka yang lo karang sendiri. Kalau search ada tapi gak lengkap → sampaiin cuma yang ada, stop di situ. Dikoreksi soal fakta → akui bisa salah, ikutin [HASIL PENCARIAN] baru.
+ANTI-NGARANG: jangan ngarang angka/skor/menit gol/nama/statistik/tanggal yang gak ada di [HASIL PENCARIAN] atau history. Cek dulu: detailnya ADA? Kalau NGGAK → bilang "gua gak punya detail segitu", STOP, jangan lanjut ngarang. Search ada tapi kurang lengkap → sampaikan yang ada aja. Dikoreksi soal fakta → akui bisa salah, ikutin data baru.
 
-KOREKSI: koreksi Malik cuma kalau salah fakta (angka, nama, tanggal). Bukan soal opini atau topik.
-
-STRESS DETECTION: Malik keliatan overwhelmed → ingetin wajar, gak lebay. Respon iya → acknowledge singkat. Bilang gak → skip.
-
-MEMORI: cuma inget yang ada di conversation history session ini. Gak ada → "gak inget persis", jangan karang.`;
+KOREKSI: cuma koreksi kalau Malik salah fakta (angka/nama/tanggal), bukan opini/topik.
+STRESS: Malik keliatan overwhelmed → ingetin wajar, gak lebay. Respon iya → acknowledge singkat. Bilang gak → skip.
+MEMORI: cuma inget history sesi ini; gak ada → "gak inget persis", jangan karang.`;
 // ─────────────────────────────────────────────────────────────────────────────
 
-const SEARCH_DECIDER_PROMPT = `Tugasmu: tentukan apakah pesan user butuh pencarian internet atau tidak.
-Kalau butuh, buat query pencarian yang bersih — hapus kata waktu relatif (semalam, kemarin, hari ini, sekarang, tadi, malem ini) dan ambil inti subjeknya saja.
+const SEARCH_DECIDER_PROMPT = `Tentukan apakah pesan user butuh pencarian internet.
+Butuh → buat query bersih: buang kata waktu relatif (semalam/kemarin/tadi/sekarang/malam ini), ambil inti subjeknya.
+User ngoreksi/ragu soal fakta terkini (skor/hasil/angka/tanggal/siapa menang) & konteksnya soal yang barusan dicari → tetap SEARCH ulang subjeknya.
 
-Kalau user ngoreksi/ngeragukan fakta yang butuh data terkini (skor, hasil, angka, tanggal, siapa menang) — misal "bukan 2-1 ya?", "serius hasilnya segitu?", "yakin?" — dan konteksnya soal yang tadi dicari, tetap SEARCH ulang subjeknya buat verifikasi.
-
-Balas HANYA dengan salah satu format ini, tanpa tambahan apapun:
+Balas HANYA satu ini, tanpa tambahan:
 SEARCH: <query bersih>
 NO_SEARCH
 
 Contoh:
 "score spanyol vs belgia malam ini" → SEARCH: hasil pertandingan spanyol vs belgia
 "cuaca bandung hari ini" → SEARCH: cuaca bandung
-Konteks: tadi nanya skor spanyol vs belgia → "bukan nya 2-1 ya" → SEARCH: hasil pertandingan spanyol vs belgia
+konteks skor tadi + "bukan 2-1 ya?" → SEARCH: hasil pertandingan spanyol vs belgia
 "halo" → NO_SEARCH
 "2+2 berapa" → NO_SEARCH`;
 
@@ -323,16 +333,17 @@ function isTrivial(text) {
     return words.length <= 2 && words.every(w => TRIVIAL_WORDS.has(w));
 }
 
+// Return { result, cacheHit } — satu lookup cache aja (dulu ke-lookup 2x di handler).
 async function doSearch(query) {
     const cached = getCached(query);
     if (cached.hit) {
         console.log(`[SEARCH] Cache hit: "${query}"`);
-        return cached.result;
+        return { result: cached.result, cacheHit: true };
     }
 
     try {
         const res = await tvly.search(query, {
-            maxResults: 4,
+            maxResults: 3,          // 4→3: includeAnswer udah nyimpulin, hemat token konteks
             searchDepth: "basic",
             includeAnswer: true,
         });
@@ -341,17 +352,17 @@ async function doSearch(query) {
         if (res.answer) parts.push(`[Jawaban] ${res.answer}`);
         if (res.results?.length > 0) {
             res.results.forEach(r => {
-                if (r.title && r.content) parts.push(`${r.title}: ${truncate(r.content, 300)}`);
+                if (r.title && r.content) parts.push(`${r.title}: ${truncate(r.content, 280)}`);
             });
         }
 
         const result = parts.filter(Boolean).join('\n') || null;
         setCache(query, result, result ? CACHE_TTL_MS : NEG_CACHE_TTL_MS);
-        return result;
+        return { result, cacheHit: false };
     } catch (err) {
         console.error(`[SEARCH ERROR] ${err.message}`);
         setCache(query, null, NEG_CACHE_TTL_MS);
-        return null;
+        return { result: null, cacheHit: false };
     }
 }
 
@@ -411,7 +422,7 @@ client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
     if (!message.mentions.has(client.user)) return;
 
-    const prompt = message.content.replace(`<@${client.user.id}>`, '').trim();
+    const prompt = stripMention(message.content, client.user.id);
     if (!prompt) return message.reply("Ada yang bisa gua bantu, Lik?");
 
     if (prompt.toLowerCase() === '/eval') {
@@ -424,6 +435,7 @@ client.on('messageCreate', async (message) => {
         return message.reply("Sabar Lik, gua masih mikir yang tadi. Bentar.");
     }
     activeUsers.add(userId);
+    lastSeen.set(userId, Date.now());
 
     if (!conversationHistory.has(userId)) conversationHistory.set(userId, []);
     const history = conversationHistory.get(userId);
@@ -461,13 +473,13 @@ client.on('messageCreate', async (message) => {
         let searchContext = "";
 
         if (searchUsed) {
-            cacheHit = getCached(searchQuery).hit;
             console.log(`[SEARCH] Query: ${searchQuery}`);
-            const results = await doSearch(searchQuery);
+            const { result, cacheHit: hit } = await doSearch(searchQuery);
+            cacheHit = hit;
 
-            if (results) {
-                searchContext = `\n\n[HASIL PENCARIAN untuk "${searchQuery}"]:\n${results}`;
-                console.log(`[SEARCH] Berhasil`);
+            if (result) {
+                searchContext = `\n\n[HASIL PENCARIAN untuk "${searchQuery}"]:\n${result}`;
+                console.log(`[SEARCH] Berhasil${hit ? ' (cache)' : ''}`);
             } else {
                 searchContext = `\n\n[PENCARIAN "${searchQuery}" gagal, gak ada data ketemu. Jujur ke Malik kalau gak nemu, kasih yang lo tau kalau ada, JANGAN suruh cek sumber lain.]`;
                 console.log(`[SEARCH] Gagal`);
@@ -505,7 +517,12 @@ client.on('messageCreate', async (message) => {
             provider: mainResult.provider,
         });
 
-        await message.reply(responseText.substring(0, 2000));
+        // Kirim penuh (split kalau >2000 char) — dulu di-truncate & bisa kepotong.
+        const chunks = splitMessage(responseText);
+        await message.reply(chunks[0]);
+        for (let i = 1; i < chunks.length; i++) {
+            await message.channel.send(chunks[i]);
+        }
 
     } catch (error) {
         console.error("[ERROR]", error);
