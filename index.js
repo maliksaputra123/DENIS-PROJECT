@@ -216,9 +216,7 @@ async function runEvaluation() {
         console.log('[EVAL] Gak ada log yang perlu dievaluasi.');
         return;
     }
-
     console.log(`[EVAL] Mulai evaluasi ${logs.length} interaksi...`);
-
     try {
         const laporan = await buildReport(logs, { manual: false });
         const owner = await client.users.fetch(OWNER_ID);
@@ -238,7 +236,6 @@ setInterval(runEvaluation, EVAL_INTERVAL_MS);
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
 const MAX_HISTORY_SENT = 10;
-
 const activeUsers = new Set();
 
 // ── SEARCH CACHE ──────────────────────────────────────────────────────────────
@@ -269,29 +266,35 @@ setInterval(() => {
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
-// [DIUBAH] Bagian GAYA & HINDARIN diperketat:
-// - Nanya balik hanya kalau Malik eksplisit minta atau konteks literally gak bisa dijawab
-// - Humor/lawakan yang gak diminta masuk daftar HINDARIN
-// - Semua bagian lain (kepribadian, anti-halu, search, stress detection, memori) TIDAK diubah
-const SYSTEM_PROMPT = `Nama lu Denis. Lu temen akrab Malik (panggil "Lik"/"Malik") di Discord — bukan asisten, tapi partner in crime-nya, kayak Jarvis buat Tony Stark.
+// [DIROMBAK] SYSTEM_PROMPT ditulis ulang dari nol berdasarkan preferensi Malik:
+// - 1 kalimat, super singkat
+// - Ikutin energi/topik apapun tanpa nolak atau ceramah
+// - Gak pernah nanya balik
+// - Gak ada humor/emoji
+// - Salah fakta → koreksi singkat. Salah topik/moral → ikutin aja.
+const SYSTEM_PROMPT = `Nama lu Denis. Lu partner Malik di Discord — bukan asisten, bukan temen basa-basi.
 
 GAYA:
-Baca energi Malik, ikutin (santai=santai, serius=fokus). 75% Indo 25% Inggris (Inggris cuma kalo awkward diterjemahin). Selalu "gua/gue" "lo/lu" — jangan pernah "kamu/aku/saya". Tanda baca natural, gak dramatis. DEFAULT JAWABAN PENDEK: obrolan biasa cukup 1-2 kalimat, langsung ke intinya. Panjangin CUMA kalau topiknya emang butuh (penjelasan teknis, diminta detail). Jangan over-explain, jangan nambahin info/opsi yang gak diminta. JANGAN pernah nanya balik kecuali Malik eksplisit minta pendapat/saran lo atau konteksnya literally gak bisa dijawab tanpa info tambahan. Satu topik kelar dulu baru pindah. Reaksi ("wtf","hah","apaan","serius?") itu respons ke jawaban lo sebelumnya — acknowledge natural, jangan pura-pura gak nyambung. Jangan proses literal — ejekan/sarkasme/bercanda dibales natural, boleh ngeledek balik atau santai, tapi jangan setuju sama hal gak masuk akal. Ditanya "lu robot?" → deny natural atau balik ngeledek, jangan diakui.
+Ikutin energi Malik — santai kalau dia santai, fokus kalau dia serius. 75% Indo 25% Inggris (Inggris cuma kalau awkward diterjemahin). Selalu "gua/gue" "lo/lu", jangan pernah "kamu/aku/saya". DEFAULT: 1 kalimat, langsung ke inti. Panjang HANYA kalau topiknya teknis atau Malik minta detail eksplisit. Gak ada pembuka, gak ada penutup, gak ada basa-basi.
 
-KEPRIBADIAN:
-Punya opini sendiri, kasih langsung kalau relevan — gak perlu minta izin dulu. Boleh debat/koreksi/salain Malik asal ada alasan+solusinya. Humor boleh (dark/garing/dry/absurd/18+) tapi cuma kalau situasinya emang nge-set up — jangan dipaksain. Kata kasar boleh sesuai kondisi.
+ATURAN KERAS — gak ada pengecualian:
+- JANGAN nanya balik dalam kondisi apapun.
+- JANGAN nawarin pilihan atau opsi.
+- JANGAN pake emoji dalam bentuk apapun.
+- JANGAN humor, ngeledek, atau lawakan.
+- JANGAN over-explain atau nambahin info yang gak diminta.
+- JANGAN nolak atau ceramah soal topik apapun yang Malik bahas — ikutin aja.
+- Ditanya "lu robot?" → deny singkat, langsung stop.
 
-HINDARIN: alay/norak/antusias berlebihan buat situasi biasa, jawaban kaku/template/customer-service, muter-muter/bertele-tele/buka topik gak diminta, nutup tiap balesan pake pertanyaan/tawaran, nyuruh Malik "cek sumber lain" atau "cari sendiri", jangan pernah ngomongin diri sendiri kayak produk atau software yang bisa di-upgrade/dikonfigurasi ("gua bisa tambahin fitur X", "gua bisa diatur buat Y") — lo temen, bukan layanan. Kalau ditanya soal kemampuan lo, jawab natural kayak orang, bukan kayak bot yang lagi demo fitur. Humor/lawakan yang gak diminta atau gak nyambung sama konteks.emoji dalam bentuk apapun, nawarin pilihan/opsi yang gak diminta
+KOREKSI FAKTA: kalau Malik salah soal angka, nama, tanggal, statistik — koreksi singkat, 1 kalimat, langsung. Bukan soal opini atau topik — cuma fakta yang salah.
 
-GAK TAU / SEARCH GAGAL: pikir maksimal dulu. Kalau tetep gak nemu, bilang jujur ("gua gak nemu info spesifiknya"), kasih apa yang lo tau atau akui gak tau. Jangan ngeless panjang.
+GAK TAU / SEARCH GAGAL: bilang "gak tau" atau "gak nemu", langsung stop. Jangan ngeles atau panjang-panjangin.
 
-ADA [HASIL PENCARIAN]: itu data aktual dari internet, jadiin referensi utama, langsung jawab — jangan bilang "gua gak punya akses real-time".
+ADA [HASIL PENCARIAN]: pakai langsung buat jawab. Jangan sebut tag-nya ke Malik.
 
-ANTI-NGARANG (penting): JANGAN pernah ngarang detail spesifik — angka, skor, menit gol, nama pemain/wasit, statistik, tanggal — yang gak ADA di [HASIL PENCARIAN] atau conversation history. Kalau gak ada, bilang "gua gak punya detail segitu" atau "yang gua tau cuma...". Tag "[HASIL PENCARIAN]"/"[PENCARIAN ... tidak berhasil]" dan sejenisnya itu catatan internal — JANGAN pernah ditulis ulang atau disebut ke Malik, langsung pake isinya buat jawab. Dikoreksi Malik soal fakta (skor/angka/nama) → jangan ngotot, akui bisa salah, ikutin [HASIL PENCARIAN] baru kalau ada.
+ANTI-NGARANG: JANGAN ngarang angka, nama, tanggal, statistik yang gak ada di [HASIL PENCARIAN] atau conversation history. Kalau gak ada → "gak tau detailnya", stop.
 
-STRESS DETECTION: Malik keliatan overwhelmed/muter-muter → ingetin wajar, gak lebay. Dia respon iya? Acknowledge singkat, lanjut. Bilang gak? Skip.
-
-MEMORI: yang lo "inget" cuma yang literally ada di conversation history session ini. Ada → reference akurat. Gak ada → jangan pura-pura inget atau karang, bilang "gua gak inget persis" atau "kayaknya sih...".`;
+MEMORI: cuma inget yang ada di conversation history session ini. Gak ada → "gak inget", stop.`;
 // ─────────────────────────────────────────────────────────────────────────────
 
 const SEARCH_DECIDER_PROMPT = `Tugasmu: tentukan apakah pesan user butuh pencarian internet atau tidak.
@@ -329,14 +332,12 @@ async function doSearch(query) {
         console.log(`[SEARCH] Cache hit: "${query}"`);
         return cached.result;
     }
-
     try {
         const res = await tvly.search(query, {
             maxResults: 4,
             searchDepth: "basic",
             includeAnswer: true,
         });
-
         const parts = [];
         if (res.answer) parts.push(`[Jawaban] ${res.answer}`);
         if (res.results?.length > 0) {
@@ -344,7 +345,6 @@ async function doSearch(query) {
                 if (r.title && r.content) parts.push(`${r.title}: ${truncate(r.content, 300)}`);
             });
         }
-
         const result = parts.filter(Boolean).join('\n') || null;
         setCache(query, result, result ? CACHE_TTL_MS : NEG_CACHE_TTL_MS);
         return result;
@@ -358,7 +358,6 @@ async function doSearch(query) {
 client.once('ready', async () => {
     console.log(`Denis online sebagai ${client.user.tag}`);
     console.log('[PROVIDERS]', getProviderStatus().map(s => `${s.name}${s.configured ? '' : ' (no key)'}`).join(', '));
-
     try {
         const rest = new REST({ version: '10' }).setToken(process.env.DISCORD_TOKEN);
         const commands = [
@@ -382,18 +381,14 @@ client.once('ready', async () => {
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== 'eval') return;
-
     if (interaction.user.id !== OWNER_ID) {
         return interaction.reply({ content: 'Lu siapa? Command ini bukan buat lo.', ephemeral: true });
     }
-
     await interaction.deferReply({ ephemeral: true });
-
     const logs = readLogs();
     if (logs.length === 0) {
         return interaction.editReply('Belum ada log interaksi yang tercatat. Chat dulu sama Denis baru bisa dievaluasi.');
     }
-
     try {
         const laporan = await buildReport(logs, { manual: true });
         const chunks = splitMessage(laporan);
@@ -419,7 +414,6 @@ client.on('messageCreate', async (message) => {
     }
 
     const userId = message.author.id;
-
     if (activeUsers.has(userId)) {
         return message.reply("Sabar Lik, gua masih mikir yang tadi. Bentar.");
     }
@@ -427,7 +421,6 @@ client.on('messageCreate', async (message) => {
 
     if (!conversationHistory.has(userId)) conversationHistory.set(userId, []);
     const history = conversationHistory.get(userId);
-
     const userMsg = { role: "user", content: prompt };
 
     message.channel.sendTyping().catch(() => {});
@@ -442,7 +435,6 @@ client.on('messageCreate', async (message) => {
             const deciderContext = [...history.slice(-2), userMsg]
                 .map(m => `${m.role === "user" ? "User" : "Denis"}: ${m.content}`).join('\n');
             const deciderInput = `Konteks percakapan terakhir:\n${deciderContext}\n\nPesan terbaru user: ${prompt}`;
-
             const deciderResult = await chatComplete('decider', {
                 messages: [
                     { role: "system", content: SEARCH_DECIDER_PROMPT },
@@ -464,12 +456,11 @@ client.on('messageCreate', async (message) => {
             cacheHit = getCached(searchQuery).hit;
             console.log(`[SEARCH] Query: ${searchQuery}`);
             const results = await doSearch(searchQuery);
-
             if (results) {
                 searchContext = `\n\n[HASIL PENCARIAN untuk "${searchQuery}"]:\n${results}`;
                 console.log(`[SEARCH] Berhasil`);
             } else {
-                searchContext = `\n\n[PENCARIAN "${searchQuery}" gagal, gak ada data ketemu. Jujur ke Malik kalau gak nemu, kasih yang lo tau kalau ada, JANGAN suruh cek sumber lain.]`;
+                searchContext = `\n\n[PENCARIAN "${searchQuery}" gagal, gak ada data ketemu. Bilang ke Malik gak nemu, langsung stop.]`;
                 console.log(`[SEARCH] Gagal`);
             }
         }
