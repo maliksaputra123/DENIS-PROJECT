@@ -17,14 +17,11 @@ const PROVIDERS = [
         name: 'Groq',
         baseURL: 'https://api.groq.com/openai/v1',
         apiKey: process.env.GROQ_API_KEY,
-        // Model per-task. Ganti string-nya di sini kalau mau tuning.
         models: {
             main: 'qwen/qwen3-32b',
             decider: 'llama-3.1-8b-instant',
             eval: 'llama-3.1-8b-instant',
         },
-        // Param ekstra khusus provider ini. qwen di Groq: matiin reasoning biar
-        // jawabannya cepet & gak boros token buat obrolan santai.
         extraBody: {
             main: { reasoning_effort: 'none' },
         },
@@ -33,8 +30,6 @@ const PROVIDERS = [
         name: 'Cerebras',
         baseURL: 'https://api.cerebras.ai/v1',
         apiKey: process.env.CEREBRAS_API_KEY,
-        // Cerebras model-nya lebih sedikit; llama-3.3-70b aman buat semua task.
-        // Kalau mau decider lebih ngebut, bisa coba ganti ke model 8b kalau ada.
         models: {
             main: 'llama-3.3-70b',
             decider: 'llama-3.3-70b',
@@ -43,13 +38,21 @@ const PROVIDERS = [
     },
 ];
 
-// Cooldown per-provider (nama → timestamp sampai kapan di-skip). Diisi pas kena 429.
-const cooldowns = new Map();
+// ── RETRY CONFIG ──────────────────────────────────────────────────────────────
+// MAX_RETRIES: berapa kali coba ulang sebelum nyerah & fallback ke provider lain.
+// CAP_MS: batas atas waktu tunggu antar retry (biar gak nunggu terlalu lama).
+// COOLDOWN_MS: kalau udah habis retry & masih gagal, skip provider ini selama ini.
+const RETRY_CONFIG = {
+    MAX_RETRIES: 2,
+    CAP_MS: 8_000,
+    COOLDOWN_MS: 60_000,
+};
 
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+const cooldowns = new Map();
 const onCooldown = (name) => (cooldowns.get(name) || 0) > Date.now();
 
-// Dipake index.js buat laporan /eval & auto-eval. Bentuknya harus:
-// { name, configured, cooldownUntil }.
 export function getProviderStatus() {
     return PROVIDERS.map(p => ({
         name: p.name,
@@ -68,7 +71,6 @@ async function callProvider(p, task, { messages, temperature, maxTokens }) {
         ...(p.extraBody?.[task] || {}),
     };
 
-    // Timeout 30s biar gak nyangkut kalau provider-nya hang.
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 30_000);
 
@@ -87,13 +89,10 @@ async function callProvider(p, task, { messages, temperature, maxTokens }) {
         clearTimeout(timeout);
     }
 
+    // Balikin status 429 biar bisa dihandle retry di luar
     if (res.status === 429) {
-        // Kena limit → kasih cooldown, biar request berikutnya langsung lari ke
-        // provider lain tanpa buang-buang waktu nyoba yang ini lagi.
         const retryAfter = parseFloat(res.headers.get('retry-after'));
-        const waitMs = (retryAfter > 0 ? retryAfter : 60) * 1000;
-        cooldowns.set(p.name, Date.now() + waitMs);
-        throw new Error(`kena rate limit (429), cooldown ${Math.round(waitMs / 1000)}s`);
+        return { rateLimited: true, retryAfter: retryAfter > 0 ? retryAfter * 1000 : null };
     }
 
     if (!res.ok) {
@@ -107,8 +106,33 @@ async function callProvider(p, task, { messages, temperature, maxTokens }) {
     return { content, model };
 }
 
-// task = 'main' | 'decider' | 'eval'. opts = { messages, temperature, maxTokens }.
-// Balikin: { content, provider, model } — sesuai yang dibaca index.js.
+// Wrapper dengan retry logic. Kalau 429, tunggu dulu (exponential backoff)
+// sebelum nyoba lagi. Baru set cooldown & throw kalau retry habis.
+async function callWithRetry(p, task, opts) {
+    const { MAX_RETRIES, CAP_MS, COOLDOWN_MS } = RETRY_CONFIG;
+
+    for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+        const result = await callProvider(p, task, opts);
+
+        if (!result.rateLimited) return result; // sukses, langsung balik
+
+        // Kena 429 — hitung berapa lama nunggu
+        // Exponential backoff: 1s → 2s → 4s, tapi di-cap & pakai retry-after
+        // dari header kalau ada (Groq biasanya kirim ini, lebih akurat).
+        const backoff = Math.min(1_000 * 2 ** attempt, CAP_MS);
+        const waitMs = result.retryAfter ?? backoff;
+
+        if (attempt < MAX_RETRIES) {
+            console.warn(`[PROVIDER ${p.name}] 429 — tunggu ${Math.round(waitMs / 1000)}s lalu retry (${attempt + 1}/${MAX_RETRIES})...`);
+            await sleep(waitMs);
+        } else {
+            // Udah habis retry, set cooldown biar request berikutnya skip langsung
+            cooldowns.set(p.name, Date.now() + COOLDOWN_MS);
+            throw new Error(`rate limit, udah retry ${MAX_RETRIES}x, cooldown ${COOLDOWN_MS / 1000}s`);
+        }
+    }
+}
+
 export async function chatComplete(task, opts) {
     const errors = [];
 
@@ -121,12 +145,11 @@ export async function chatComplete(task, opts) {
         }
 
         try {
-            const { content, model } = await callProvider(p, task, opts);
+            const { content, model } = await callWithRetry(p, task, opts);
             return { content, provider: p.name, model };
         } catch (err) {
             console.error(`[PROVIDER ${p.name}] ${err.message}`);
             errors.push(`${p.name}: ${err.message}`);
-            // lanjut ke provider berikutnya
         }
     }
 
