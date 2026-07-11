@@ -18,9 +18,12 @@ const PROVIDERS = [
         baseURL: 'https://api.groq.com/openai/v1',
         apiKey: process.env.GROQ_API_KEY,
         models: {
-            main: 'llama-3.3-70b-versatile',
+            main: 'qwen/qwen3-32b',
             decider: 'llama-3.1-8b-instant',
             eval: 'llama-3.1-8b-instant',
+        },
+        extraBody: {
+            main: { reasoning_effort: 'none' },
         },
     },
     {
