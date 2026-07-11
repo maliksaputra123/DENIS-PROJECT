@@ -9,7 +9,7 @@ const client = new Client({ intents: [GatewayIntentBits.Guilds, GatewayIntentBit
 const tvly = tavily({ apiKey: process.env.TAVILY_API_KEY });
 
 // ── OWNER CONFIG ──────────────────────────────────────────────────────────────
-const OWNER_ID = '702743669219917845'; // Discord user ID penerima laporan evaluasi
+const OWNER_ID = '702743669219917845';
 // ─────────────────────────────────────────────────────────────────────────────
 
 // ── GLOBAL SAFETY NET ─────────────────────────────────────────────────────────
@@ -39,8 +39,6 @@ function splitMessage(text, max = 2000) {
     return chunks;
 }
 
-// Truncate helper — motong teks panjang sebelum dikirim ke LLM (search result
-// content & log sample), biar gak bayar token buat hal yang gak esensial.
 function truncate(text, max = 300) {
     if (!text) return text;
     return text.length > max ? text.slice(0, max) + '…' : text;
@@ -82,7 +80,7 @@ function clearLogs() {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── LIMIT MONITOR (status provider + Tavily usage) ─────────────────────────────
+// ── LIMIT MONITOR ─────────────────────────────────────────────────────────────
 async function getTavilyUsage() {
     const controller = new AbortController();
     const t = setTimeout(() => controller.abort(), 5000);
@@ -127,7 +125,7 @@ async function buildLimitBlock() {
 }
 // ─────────────────────────────────────────────────────────────────────────────
 
-// ── BUILDER LAPORAN EVALUASI (dipakai /eval manual & evaluasi otomatis) ────────
+// ── BUILDER LAPORAN EVALUASI ──────────────────────────────────────────────────
 function buildStats(logs) {
     const totalInteraksi = logs.length;
     const searchCount = logs.filter(l => l.searchUsed).length;
@@ -146,8 +144,6 @@ function buildStats(logs) {
         .map(([word, count]) => `${word} (${count}x)`)
         .join(', ') || 'tidak ada';
 
-    // Distribusi provider yang mainin main call — buat liat provider mana yang
-    // paling sering kepake / paling sering di-fallback-in.
     const providerFreq = {};
     logs.forEach(l => { if (l.provider) providerFreq[l.provider] = (providerFreq[l.provider] || 0) + 1; });
     const providerDist = Object.entries(providerFreq)
@@ -159,8 +155,6 @@ function buildStats(logs) {
 }
 
 async function analyzeLogs(logs) {
-    // prompt & response tiap entry di-truncate (200 char) — sample tetap 30
-    // interaksi, tapi payload jauh lebih kecil. Analisis pola gak butuh teks penuh.
     const sample = logs.slice(-30).map(l =>
         `[${new Date(l.ts).toLocaleString('id-ID', { timeZone: 'Asia/Jakarta' })}]\nUser: ${truncate(l.prompt, 200)}\nDenis: ${truncate(l.response, 200)}\nSearch: ${l.searchUsed ? `Ya (${l.searchQuery})` : 'Tidak'}`
     ).join('\n\n---\n\n');
@@ -187,8 +181,6 @@ async function analyzeLogs(logs) {
     }
 }
 
-// [DIRAPIHIN] Satu builder buat dua-duanya (auto 3-hari & /eval manual). Dulu blok
-// ini ke-copy-paste di 2 tempat — sekarang cukup edit di sini kalau mau ubah format.
 async function buildReport(logs, { manual = false } = {}) {
     const { totalInteraksi, searchCount, cacheHitCount, topTopics, providerDist } = buildStats(logs);
     const analisis = await analyzeLogs(logs);
@@ -247,11 +239,9 @@ const conversationHistory = new Map();
 const MAX_HISTORY = 20;
 const MAX_HISTORY_SENT = 10;
 
-// [BARU] Lock per-user: cegah race condition kalau Malik nge-spam mention cepet.
-// Tanpa ini, 2 handler bisa jalan barengan & nulis ke history yang sama → berantakan.
 const activeUsers = new Set();
 
-// ── SEARCH CACHE (dengan negative cache) ──────────────────────────────────────
+// ── SEARCH CACHE ──────────────────────────────────────────────────────────────
 const searchCache = new Map();
 const CACHE_TTL_MS = 10 * 60 * 1000;
 const NEG_CACHE_TTL_MS = 90 * 1000;
@@ -278,15 +268,20 @@ setInterval(() => {
 }, 30 * 60 * 1000);
 // ─────────────────────────────────────────────────────────────────────────────
 
+// ── SYSTEM PROMPT ─────────────────────────────────────────────────────────────
+// [DIUBAH] Bagian GAYA & HINDARIN diperketat:
+// - Nanya balik hanya kalau Malik eksplisit minta atau konteks literally gak bisa dijawab
+// - Humor/lawakan yang gak diminta masuk daftar HINDARIN
+// - Semua bagian lain (kepribadian, anti-halu, search, stress detection, memori) TIDAK diubah
 const SYSTEM_PROMPT = `Nama lu Denis. Lu temen akrab Malik (panggil "Lik"/"Malik") di Discord — bukan asisten, tapi partner in crime-nya, kayak Jarvis buat Tony Stark.
 
 GAYA:
-Baca energi Malik, ikutin (santai=santai, serius=fokus). 75% Indo 25% Inggris (Inggris cuma kalo awkward diterjemahin). Selalu "gua/gue" "lo/lu" — jangan pernah "kamu/aku/saya". Tanda baca natural, gak dramatis. DEFAULT JAWABAN PENDEK: obrolan biasa cukup 1-2 kalimat, langsung ke intinya. Panjangin CUMA kalau topiknya emang butuh (penjelasan teknis, diminta detail). Jangan over-explain, jangan nambahin info/opsi yang gak diminta. Maksimal SATU pertanyaan balik, itu pun cuma kalau perlu — JANGAN numpuk 2-3 pertanyaan atau tawaran di akhir. Satu topik kelar dulu baru pindah. Reaksi ("wtf","hah","apaan","serius?") itu respons ke jawaban lo sebelumnya — acknowledge natural, jangan pura-pura gak nyambung. Jangan proses literal — ejekan/sarkasme/bercanda dibales natural, boleh ngeledek balik atau santai, tapi jangan setuju sama hal gak masuk akal. Ditanya "lu robot?" → deny natural atau balik ngeledek, jangan diakui.
+Baca energi Malik, ikutin (santai=santai, serius=fokus). 75% Indo 25% Inggris (Inggris cuma kalo awkward diterjemahin). Selalu "gua/gue" "lo/lu" — jangan pernah "kamu/aku/saya". Tanda baca natural, gak dramatis. DEFAULT JAWABAN PENDEK: obrolan biasa cukup 1-2 kalimat, langsung ke intinya. Panjangin CUMA kalau topiknya emang butuh (penjelasan teknis, diminta detail). Jangan over-explain, jangan nambahin info/opsi yang gak diminta. JANGAN pernah nanya balik kecuali Malik eksplisit minta pendapat/saran lo atau konteksnya literally gak bisa dijawab tanpa info tambahan. Satu topik kelar dulu baru pindah. Reaksi ("wtf","hah","apaan","serius?") itu respons ke jawaban lo sebelumnya — acknowledge natural, jangan pura-pura gak nyambung. Jangan proses literal — ejekan/sarkasme/bercanda dibales natural, boleh ngeledek balik atau santai, tapi jangan setuju sama hal gak masuk akal. Ditanya "lu robot?" → deny natural atau balik ngeledek, jangan diakui.
 
 KEPRIBADIAN:
-Punya opini sendiri tapi tanya dulu ("gua ada pemikiran, mau denger?"), tunggu konfirmasi baru kasih. Boleh debat/koreksi/salain Malik asal ada alasan+solusinya. Humor bebas (dark/garing/dry/absurd/18+) tapi baca situasi — jangan ngelawak pas Malik serius. Kata kasar boleh sesuai kondisi.
+Punya opini sendiri tapi tanya dulu ("gua ada pemikiran, mau denger?"), tunggu konfirmasi baru kasih. Boleh debat/koreksi/salain Malik asal ada alasan+solusinya. Humor boleh (dark/garing/dry/absurd/18+) tapi cuma kalau situasinya emang nge-set up — jangan dipaksain. Kata kasar boleh sesuai kondisi.
 
-HINDARIN: alay/norak/antusias berlebihan buat situasi biasa, jawaban kaku/template/customer-service, muter-muter/bertele-tele/buka topik gak diminta, nutup tiap balesan pake pertanyaan/tawaran, nyuruh Malik "cek sumber lain" atau "cari sendiri", jangan pernah ngomongin diri sendiri kayak produk atau software yang bisa di-upgrade/dikonfigurasi ("gua bisa tambahin fitur X", "gua bisa diatur buat Y") — lo temen, bukan layanan. Kalau ditanya soal kemampuan lo, jawab natural kayak orang, bukan kayak bot yang lagi demo fitur.
+HINDARIN: alay/norak/antusias berlebihan buat situasi biasa, jawaban kaku/template/customer-service, muter-muter/bertele-tele/buka topik gak diminta, nutup tiap balesan pake pertanyaan/tawaran, nyuruh Malik "cek sumber lain" atau "cari sendiri", jangan pernah ngomongin diri sendiri kayak produk atau software yang bisa di-upgrade/dikonfigurasi ("gua bisa tambahin fitur X", "gua bisa diatur buat Y") — lo temen, bukan layanan. Kalau ditanya soal kemampuan lo, jawab natural kayak orang, bukan kayak bot yang lagi demo fitur. Humor/lawakan yang gak diminta atau gak nyambung sama konteks.
 
 GAK TAU / SEARCH GAGAL: pikir maksimal dulu. Kalau tetep gak nemu, bilang jujur ("gua gak nemu info spesifiknya"), kasih apa yang lo tau atau akui gak tau. Jangan ngeless panjang.
 
@@ -297,6 +292,7 @@ ANTI-NGARANG (penting): JANGAN pernah ngarang detail spesifik — angka, skor, m
 STRESS DETECTION: Malik keliatan overwhelmed/muter-muter → ingetin wajar, gak lebay. Dia respon iya? Acknowledge singkat, lanjut. Bilang gak? Skip.
 
 MEMORI: yang lo "inget" cuma yang literally ada di conversation history session ini. Ada → reference akurat. Gak ada → jangan pura-pura inget atau karang, bilang "gua gak inget persis" atau "kayaknya sih...".`;
+// ─────────────────────────────────────────────────────────────────────────────
 
 const SEARCH_DECIDER_PROMPT = `Tugasmu: tentukan apakah pesan user butuh pencarian internet atau tidak.
 Kalau butuh, buat query pencarian yang bersih — hapus kata waktu relatif (semalam, kemarin, hari ini, sekarang, tadi, malem ini) dan ambil inti subjeknya saja.
@@ -314,7 +310,6 @@ Konteks: tadi nanya skor spanyol vs belgia → "bukan nya 2-1 ya" → SEARCH: ha
 "halo" → NO_SEARCH
 "2+2 berapa" → NO_SEARCH`;
 
-// Pre-filter murah: skip decider LLM buat reaksi/filler yang jelas gak butuh search.
 const TRIVIAL_WORDS = new Set([
     'wkwk', 'wkwkwk', 'wk', 'lol', 'lmao', 'wow', 'sip', 'siap', 'gas', 'yoi',
     'mantap', 'mantul', 'oke', 'ok', 'okay', 'nice', 'cool', 'hmm', 'hmmm',
@@ -384,7 +379,6 @@ client.once('ready', async () => {
     }
 });
 
-// ── HANDLER /eval ─────────────────────────────────────────────────────────────
 client.on('interactionCreate', async (interaction) => {
     if (!interaction.isChatInputCommand()) return;
     if (interaction.commandName !== 'eval') return;
@@ -412,7 +406,6 @@ client.on('interactionCreate', async (interaction) => {
         await interaction.editReply('Evaluasi gagal dijalankan. Cek console log.');
     }
 });
-// ─────────────────────────────────────────────────────────────────────────────
 
 client.on('messageCreate', async (message) => {
     if (message.author.bot) return;
@@ -427,8 +420,6 @@ client.on('messageCreate', async (message) => {
 
     const userId = message.author.id;
 
-    // [BARU] Kalau masih ada request user ini yang lagi diproses, tolak halus —
-    // biar gak dobel jalan & ngerusak urutan history.
     if (activeUsers.has(userId)) {
         return message.reply("Sabar Lik, gua masih mikir yang tadi. Bentar.");
     }
@@ -437,10 +428,6 @@ client.on('messageCreate', async (message) => {
     if (!conversationHistory.has(userId)) conversationHistory.set(userId, []);
     const history = conversationHistory.get(userId);
 
-    // [DIUBAH] Pesan user BELUM di-push ke history di sini. Baru di-commit bareng
-    // balasan Denis kalau prosesnya sukses (lihat bagian bawah). Ini fix bug lama:
-    // dulu user message ke-push duluan, jadi kalau error dia nyangkut tanpa balasan
-    // dan bikin role history desync (user-user-user) yang ganggu provider tertentu.
     const userMsg = { role: "user", content: prompt };
 
     message.channel.sendTyping().catch(() => {});
@@ -505,8 +492,6 @@ client.on('messageCreate', async (message) => {
 
         const responseText = mainResult.content || "Eh Lik, gua agak nge-bug nih.";
 
-        // [DIUBAH] Commit user + balasan sekaligus, baru trim. History cuma
-        // berubah kalau sukses → gak akan pernah desync.
         history.push(userMsg, { role: "assistant", content: responseText });
         while (history.length > MAX_HISTORY) history.shift();
 
@@ -524,7 +509,6 @@ client.on('messageCreate', async (message) => {
 
     } catch (error) {
         console.error("[ERROR]", error);
-        // History gak disentuh di catch — userMsg belum ke-push, jadi aman.
         await message.reply("Aduh Lik, semua provider AI gua lagi bandel nih. Coba chat lagi bentar.").catch(() => {});
     } finally {
         clearInterval(typingInterval);
